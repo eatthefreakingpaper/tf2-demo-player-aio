@@ -1,4 +1,7 @@
 use adw::prelude::*;
+use demo_analysis::lib::algorithm::get_algorithms;
+use demo_analysis::lib::parameters::Parameter;
+use itertools::Itertools;
 use relm4::prelude::*;
 
 use crate::{rcon_manager::RconManager, settings::Settings};
@@ -11,10 +14,16 @@ pub enum PreferencesMsg {
 
     DoubleclickPlay(bool),
     PauseAfterSeek(bool),
+    StripConsoleCommands(bool),
     EventSkipOffset(f64),
     TF2FolderPath,
     RConPassword(String),
     RConPort(f64),
+
+    CheatAlgoEnabled(String, bool),
+    CheatAlgoParamFloat(String, String, f32),
+    CheatAlgoParamInt(String, String, i32),
+    CheatAlgoParamBool(String, String, bool),
 }
 
 #[derive(Debug)]
@@ -70,6 +79,15 @@ impl Component for PreferencesModel {
                         set_active: model.settings.pause_after_seek,
                         connect_active_notify[sender] => move |sr| {
                             sender.input(PreferencesMsg::PauseAfterSeek(sr.is_active()));
+                        }
+                    },
+
+                    adw::SwitchRow {
+                        set_title: "Strip console commands from replays",
+                        set_subtitle: "Remove recorded console commands (e.g. exec'd configs) before converting a demo to a replay",
+                        set_active: model.settings.strip_console_commands,
+                        connect_active_notify[sender] => move |sr| {
+                            sender.input(PreferencesMsg::StripConsoleCommands(sr.is_active()));
                         }
                     },
 
@@ -151,6 +169,22 @@ impl Component for PreferencesModel {
                     }
                 }
             },
+
+            add = &adw::PreferencesPage {
+                set_icon_name: Some("security-high-symbolic"),
+                set_title: "Cheat Detection",
+
+                adw::PreferencesGroup {
+                    set_title: "Detection Algorithms",
+                    set_description: Some("Enable/disable algorithms and tune their thresholds. Changes take effect on the next scan."),
+
+                    #[name = "cheat_algo_list"]
+                    gtk::ListBox {
+                        set_selection_mode: gtk::SelectionMode::None,
+                        add_css_class: "boxed-list",
+                    },
+                },
+            },
         }
     }
 
@@ -167,6 +201,8 @@ impl Component for PreferencesModel {
         };
 
         let widgets = view_output!();
+
+        Self::build_cheat_algo_rows(&widgets.cheat_algo_list, &model.settings, &sender);
 
         ComponentParts { model, widgets }
     }
@@ -197,6 +233,7 @@ impl Component for PreferencesModel {
             }
             PreferencesMsg::DoubleclickPlay(p) => self.settings.doubleclick_play = p,
             PreferencesMsg::PauseAfterSeek(p) => self.settings.pause_after_seek = p,
+            PreferencesMsg::StripConsoleCommands(p) => self.settings.strip_console_commands = p,
             PreferencesMsg::EventSkipOffset(off) => self.settings.event_skip_predelay = off as f32,
             PreferencesMsg::RConPassword(pass) => self.settings.rcon_pw = pass,
             PreferencesMsg::RConPort(port) => self.settings.rcon_port = port as u16,
@@ -219,6 +256,30 @@ impl Component for PreferencesModel {
                         Err(e) => log::warn!("Error while picking folder: {e}"),
                     },
                 );
+            }
+            PreferencesMsg::CheatAlgoEnabled(algo, enabled) => {
+                self.settings.cheat_algo_enabled.insert(algo, enabled);
+            }
+            PreferencesMsg::CheatAlgoParamFloat(algo, param, value) => {
+                self.settings
+                    .cheat_algo_params
+                    .entry(algo)
+                    .or_default()
+                    .insert(param, Parameter::Float(value));
+            }
+            PreferencesMsg::CheatAlgoParamInt(algo, param, value) => {
+                self.settings
+                    .cheat_algo_params
+                    .entry(algo)
+                    .or_default()
+                    .insert(param, Parameter::Int(value));
+            }
+            PreferencesMsg::CheatAlgoParamBool(algo, param, value) => {
+                self.settings
+                    .cheat_algo_params
+                    .entry(algo)
+                    .or_default()
+                    .insert(param, Parameter::Bool(value));
             }
         }
     }
@@ -244,6 +305,108 @@ impl Component for PreferencesModel {
                 }
                 self.settings.tf_folder_path = Some(path);
             }
+        }
+    }
+}
+
+impl PreferencesModel {
+    fn build_cheat_algo_rows(list: &gtk::ListBox, settings: &Settings, sender: &ComponentSender<Self>) {
+        for mut algo in get_algorithms()
+            .into_iter()
+            .sorted_by_key(|a| a.algorithm_name().to_string())
+        {
+            let name = algo.algorithm_name().to_string();
+            let enabled = settings
+                .cheat_algo_enabled
+                .get(&name)
+                .copied()
+                .unwrap_or_else(|| algo.default());
+
+            let row = adw::ExpanderRow::new();
+            row.set_title(&name);
+            row.set_show_enable_switch(false);
+
+            let switch = gtk::Switch::new();
+            switch.set_valign(gtk::Align::Center);
+            switch.set_active(enabled);
+            {
+                let sender = sender.clone();
+                let name = name.clone();
+                switch.connect_active_notify(move |sw| {
+                    sender.input(PreferencesMsg::CheatAlgoEnabled(name.clone(), sw.is_active()));
+                });
+            }
+            row.add_suffix(&switch);
+
+            let overrides = settings
+                .cheat_algo_params
+                .get(&name)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(params) = algo.params() {
+                for (param_name, default_value) in params.iter().sorted_by_key(|p| p.0.clone()) {
+                    let value = overrides
+                        .get(param_name)
+                        .cloned()
+                        .unwrap_or_else(|| default_value.clone());
+                    match value {
+                        Parameter::Float(f) => {
+                            let adjustment = gtk::Adjustment::new(
+                                f as f64, -100000.0, 100000.0, 0.001, 1.0, 0.0,
+                            );
+                            let param_row = adw::SpinRow::new(Some(&adjustment), 0.001, 3);
+                            param_row.set_title(param_name);
+                            let sender = sender.clone();
+                            let algo_name = name.clone();
+                            let param_name = param_name.clone();
+                            adjustment.connect_value_changed(move |adj| {
+                                sender.input(PreferencesMsg::CheatAlgoParamFloat(
+                                    algo_name.clone(),
+                                    param_name.clone(),
+                                    adj.value() as f32,
+                                ));
+                            });
+                            row.add_row(&param_row);
+                        }
+                        Parameter::Int(i) => {
+                            let adjustment = gtk::Adjustment::new(
+                                i as f64, -1000000.0, 1000000.0, 1.0, 10.0, 0.0,
+                            );
+                            let param_row = adw::SpinRow::new(Some(&adjustment), 1.0, 0);
+                            param_row.set_title(param_name);
+                            let sender = sender.clone();
+                            let algo_name = name.clone();
+                            let param_name = param_name.clone();
+                            adjustment.connect_value_changed(move |adj| {
+                                sender.input(PreferencesMsg::CheatAlgoParamInt(
+                                    algo_name.clone(),
+                                    param_name.clone(),
+                                    adj.value() as i32,
+                                ));
+                            });
+                            row.add_row(&param_row);
+                        }
+                        Parameter::Bool(b) => {
+                            let param_row = adw::SwitchRow::new();
+                            param_row.set_title(param_name);
+                            param_row.set_active(b);
+                            let sender = sender.clone();
+                            let algo_name = name.clone();
+                            let param_name = param_name.clone();
+                            param_row.connect_active_notify(move |sr| {
+                                sender.input(PreferencesMsg::CheatAlgoParamBool(
+                                    algo_name.clone(),
+                                    param_name.clone(),
+                                    sr.is_active(),
+                                ));
+                            });
+                            row.add_row(&param_row);
+                        }
+                    }
+                }
+            }
+
+            list.append(&row);
         }
     }
 }

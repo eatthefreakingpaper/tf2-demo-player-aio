@@ -3,6 +3,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use adw::prelude::*;
+use rayon::prelude::*;
 use relm4::actions::RelmAction;
 use relm4::actions::RelmActionGroup;
 use relm4::prelude::*;
@@ -20,6 +21,7 @@ use demo_list::*;
 use info_pane::InfoPaneMsg;
 
 use super::about_window::AboutModel;
+use super::player_search::{PlayerSearchModel, PlayerSearchMsg, PlayerSearchOut};
 use info_pane::InfoPaneModel;
 use info_pane::InfoPaneOut;
 
@@ -56,6 +58,7 @@ pub enum DemoPlayerMsg {
     ReloadFolder,
     ShowSidebar,
     FavoriteFolder,
+    SelectAllDemos,
 
     DemosChanged(bool),
 
@@ -64,6 +67,9 @@ pub enum DemoPlayerMsg {
     DemoSelected(Option<String>, bool),
     DemoSave(Demo),
     DemoUpdate(Demo),
+
+    OpenPlayerSearch,
+    CopyDemosToFolder(String, Vec<String>),
 }
 
 relm4::new_action_group!(AppMenu, "app-menu");
@@ -90,6 +96,7 @@ pub struct DemoPlayerModel {
 
     demo_list: Controller<DemoListModel>,
     demo_details: Controller<InfoPaneModel>,
+    player_search: Controller<PlayerSearchModel>,
 }
 
 #[relm4::component(async pub)]
@@ -119,6 +126,18 @@ impl AsyncComponent for DemoPlayerModel {
                     pack_start = &gtk::Button{
                         set_icon_name: "open-menu-symbolic",
                         connect_clicked => DemoPlayerMsg::ShowSidebar,
+                    },
+
+                    pack_start = &gtk::Button{
+                        set_icon_name: "system-search-symbolic",
+                        set_tooltip_text: Some("Search players"),
+                        connect_clicked => DemoPlayerMsg::OpenPlayerSearch,
+                    },
+
+                    pack_start = &gtk::Button{
+                        set_icon_name: "edit-select-all-symbolic",
+                        set_tooltip_text: Some("Select all demos"),
+                        connect_clicked => DemoPlayerMsg::SelectAllDemos,
                     },
 
                     pack_end = &adw::SplitButton{
@@ -295,16 +314,28 @@ impl AsyncComponent for DemoPlayerModel {
 
         let about_wnd = AboutModel::builder().launch(root.clone()).detach();
 
+        let demo_manager = Arc::new(Mutex::new(DemoManager::new()));
+
+        let player_search = PlayerSearchModel::builder()
+            .launch(demo_manager.clone())
+            .forward(sender.input_sender(), |msg| match msg {
+                PlayerSearchOut::SelectDemo(name) => DemoPlayerMsg::DemoSelected(Some(name), true),
+                PlayerSearchOut::CopyDemos(display, demos) => {
+                    DemoPlayerMsg::CopyDemosToFolder(display, demos)
+                }
+            });
+
         let model = {
             let settings_clone = settings.borrow().clone();
             Self {
-                demo_manager: Arc::new(Mutex::new(DemoManager::new())),
+                demo_manager,
                 rcon_manager: RconManager::new(&settings_clone.rcon_pw, settings_clone.rcon_port),
                 settings,
                 preferences_wnd: None,
                 about_wnd,
                 demo_list,
                 demo_details,
+                player_search,
                 selected_demo: None,
                 loading: None,
             }
@@ -472,8 +503,12 @@ impl AsyncComponent for DemoPlayerModel {
             }
             DemoPlayerMsg::DemoSelected(opt_name, reselected) => {
                 let mut demo = None::<Demo>;
-                if let Some(name) = opt_name {
-                    demo = self.demo_manager.lock().unwrap().get_demo(&name).cloned();
+                if let Some(name) = &opt_name {
+                    demo = self.demo_manager.lock().unwrap().get_demo(name).cloned();
+                    if reselected {
+                        self.demo_list
+                            .emit(DemoListMsg::SelectByName(name.clone()));
+                    }
                 }
                 self.demo_details
                     .emit(InfoPaneMsg::Display(demo.clone(), reselected));
@@ -525,11 +560,9 @@ impl AsyncComponent for DemoPlayerModel {
                 }
             }
             DemoPlayerMsg::DeleteSelected => {
-                let count = self.demo_list.model().get_selected_demos().len();
-                if util::delete_dialog(root, count).await {
-                    for d in self.demo_list.model().get_selected_demos() {
-                        self.demo_manager.lock().unwrap().delete_demo(&d).await;
-                    }
+                let selected = self.demo_list.model().get_selected_demos();
+                if util::delete_dialog(root, selected.len()).await {
+                    self.demo_manager.lock().unwrap().delete_demos(selected).await;
                     sender.input(DemoPlayerMsg::DemosChanged(false));
                 }
             }
@@ -554,6 +587,75 @@ impl AsyncComponent for DemoPlayerModel {
             }
             DemoPlayerMsg::ShowAbout => {
                 self.about_wnd.emit(AboutMsg::Open);
+            }
+            DemoPlayerMsg::OpenPlayerSearch => {
+                self.player_search.emit(PlayerSearchMsg::Open);
+            }
+            DemoPlayerMsg::SelectAllDemos => {
+                self.demo_list.emit(DemoListMsg::SelectAll);
+            }
+            DemoPlayerMsg::CopyDemosToFolder(display_name, demo_names) => 'copy_demos: {
+                let Some(base) = self.settings.borrow().demo_folder_path.clone() else {
+                    util::notice_dialog(
+                        root,
+                        "No demo folder set",
+                        "Open a demo folder first.",
+                    );
+                    break 'copy_demos;
+                };
+
+                let safe_name: String = display_name
+                    .chars()
+                    .map(|c| {
+                        if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                let dest = base.join("PlayerDemos").join(safe_name.trim());
+
+                if let Err(e) = std::fs::create_dir_all(&dest) {
+                    util::notice_dialog(
+                        root,
+                        "Failed to create destination folder",
+                        &e.to_string(),
+                    );
+                    break 'copy_demos;
+                }
+
+                let demos: Vec<Demo> = {
+                    let dm = self.demo_manager.lock().unwrap();
+                    demo_names
+                        .iter()
+                        .filter_map(|n| dm.get_demo(n).cloned())
+                        .collect()
+                };
+
+                demos.par_iter().for_each(|demo| {
+                    let target = dest.join(&demo.filename);
+                    if let Err(e) = std::fs::copy(&demo.path, &target) {
+                        log::warn!(
+                            "Failed to copy {} to {}: {}",
+                            demo.path.display(),
+                            target.display(),
+                            e
+                        );
+                        return;
+                    }
+                    let mut bookmark_src = demo.path.clone();
+                    bookmark_src.set_extension("json");
+                    if bookmark_src.exists() {
+                        let mut bookmark_dst = target.clone();
+                        bookmark_dst.set_extension("json");
+                        let _ = std::fs::copy(&bookmark_src, &bookmark_dst);
+                    }
+                });
+
+                if let Err(e) = opener::open(&dest) {
+                    log::warn!("Failed to open folder {}: {}", dest.display(), e);
+                }
             }
         }
         self.update_view(widgets, sender);

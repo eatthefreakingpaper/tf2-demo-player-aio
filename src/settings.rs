@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{collections::HashMap, fs, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +14,13 @@ pub struct Settings {
     pub event_skip_predelay: f32,
     pub doubleclick_play: bool,
     pub pause_after_seek: bool,
+    pub strip_console_commands: bool,
     pub favorited_folders: Vec<PathBuf>,
+
+    // Overrides for `CheatAlgorithm::default()`; algorithms missing here use their own default.
+    pub cheat_algo_enabled: HashMap<String, bool>,
+    // Overrides for `CheatAlgorithm::params()`; missing algorithms/params use their own defaults.
+    pub cheat_algo_params: demo_analysis::lib::parameters::Config,
 
     #[serde(skip)]
     pub first_launch: bool,
@@ -32,7 +38,11 @@ impl Default for Settings {
             event_skip_predelay: 30.0,
             doubleclick_play: false,
             pause_after_seek: true,
+            strip_console_commands: true,
             favorited_folders: demos_folder.map_or_else(|| Vec::new(), |f| vec![f]),
+
+            cheat_algo_enabled: HashMap::new(),
+            cheat_algo_params: HashMap::new(),
 
             first_launch: false,
         }

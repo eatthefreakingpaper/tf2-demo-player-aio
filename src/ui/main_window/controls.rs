@@ -7,10 +7,13 @@ use relm4_icons::icon_names;
 
 use crate::demo_manager::Demo;
 use crate::settings::Settings;
+use crate::ui::cheater_window::CheaterMsg;
 use crate::ui::inspection_window::InspectionMsg;
 use crate::util::sec_to_timestamp;
 use crate::util::ticks_to_sec;
 
+use super::super::cheater_window::CheaterModel;
+use super::super::cheater_window::CheaterOut;
 use super::super::inspection_window::InspectionModel;
 use super::super::inspection_window::InspectionOut;
 use super::super::main_window::RconAction;
@@ -20,6 +23,7 @@ use super::util;
 pub enum ControlsOut {
     Rcon(RconAction),
     DemoInspected(Demo),
+    CheatersChecked(Demo),
 
     SaveChanges,
     DiscardChanges,
@@ -40,6 +44,8 @@ pub enum ControlsMsg {
     ConvertReplay,
     InspectDemo,
     DemoInspected(Demo),
+    CheckCheaters,
+    CheatersChecked(Demo),
 
     SaveChanges,
     DiscardChanges,
@@ -54,6 +60,7 @@ pub struct ControlsModel {
     settings: Rc<RefCell<Settings>>,
 
     inspection_wnd: Controller<InspectionModel>,
+    cheater_wnd: Controller<CheaterModel>,
 }
 
 #[relm4::component(async pub)]
@@ -181,6 +188,12 @@ impl AsyncComponent for ControlsModel {
                         set_icon_name: icon_names::LIST_COMPACT,
                         set_tooltip_text: Some("Inspect demo"),
                         connect_clicked => ControlsMsg::InspectDemo,
+                    },
+
+                    gtk::Button{
+                        set_icon_name: icon_names::CHECK_ROUND_OUTLINE,
+                        set_tooltip_text: Some("Check for cheaters"),
+                        connect_clicked => ControlsMsg::CheckCheaters,
                     }
                 },
 
@@ -224,6 +237,13 @@ impl AsyncComponent for ControlsModel {
                 |msg| match msg {
                     InspectionOut::GotoTick(tick) => ControlsMsg::PlayheadMoved(tick.into()),
                     InspectionOut::DemoProcessed(dem) => ControlsMsg::DemoInspected(dem),
+                },
+            ),
+            cheater_wnd: CheaterModel::builder().launch(()).forward(
+                sender.input_sender(),
+                |msg| match msg {
+                    CheaterOut::GotoTick(tick) => ControlsMsg::PlayheadMoved(tick.into()),
+                    CheaterOut::DemoChecked(dem) => ControlsMsg::CheatersChecked(dem),
                 },
             ),
         };
@@ -349,7 +369,12 @@ impl AsyncComponent for ControlsModel {
                     )
                     .await
                     {
-                        match demo.convert_to_replay(&replay_folder, &title).await {
+                        let strip_console_commands =
+                            self.settings.borrow().strip_console_commands;
+                        match demo
+                            .convert_to_replay(&replay_folder, &title, strip_console_commands)
+                            .await
+                        {
                             Ok(_) => {
                                 util::notice_dialog(&self.window, "Replay created successfully", "")
                             }
@@ -365,6 +390,25 @@ impl AsyncComponent for ControlsModel {
             ControlsMsg::InspectDemo => {
                 let demo_clone = self.demo.clone().unwrap();
                 self.inspection_wnd.emit(InspectionMsg::Inspect(demo_clone));
+            }
+            ControlsMsg::CheckCheaters => {
+                let demo_clone = self.demo.clone().unwrap();
+                let settings = self.settings.borrow();
+                self.cheater_wnd.emit(CheaterMsg::Check(
+                    demo_clone,
+                    settings.cheat_algo_enabled.clone(),
+                    settings.cheat_algo_params.clone(),
+                ));
+            }
+            ControlsMsg::CheatersChecked(dem) => {
+                if self
+                    .demo
+                    .as_ref()
+                    .map_or(false, |d| d.filename == dem.filename)
+                {
+                    self.demo = Some(dem.clone());
+                }
+                let _ = sender.output(ControlsOut::CheatersChecked(dem));
             }
             ControlsMsg::DiscardChanges => {
                 let _ = sender.output(ControlsOut::DiscardChanges);

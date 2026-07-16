@@ -101,6 +101,7 @@ impl Component for InfoPaneModel {
                 .forward(sender.input_sender(), |msg| match msg {
                     ControlsOut::Rcon(act) => InfoPaneMsg::Rcon(act),
                     ControlsOut::DemoInspected(dem) => InfoPaneMsg::DemoInspected(dem),
+                    ControlsOut::CheatersChecked(dem) => InfoPaneMsg::DemoInspected(dem),
 
                     ControlsOut::SaveChanges => InfoPaneMsg::SaveChanges,
                     ControlsOut::DiscardChanges => InfoPaneMsg::DiscardChanges,

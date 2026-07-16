@@ -19,6 +19,8 @@ pub struct DemoListModel {
 pub enum DemoListMsg {
     Update(HashMap<String, Demo>, bool),
     SelectionChanged,
+    SelectByName(String),
+    SelectAll,
 }
 
 #[derive(Debug)]
@@ -350,6 +352,22 @@ impl Component for DemoListModel {
                     .name();
 
                 let _ = sender.output(DemoListOut::SelectionChanged(Some(dem_name)));
+            }
+            DemoListMsg::SelectByName(name) => {
+                let model = self.list_selection.model().unwrap();
+                for i in 0..model.n_items() {
+                    let Some(item) = model.item(i) else {
+                        continue;
+                    };
+                    let demo = item.downcast_ref::<DemoObject>().unwrap();
+                    if demo.name() == name {
+                        self.list_selection.select_item(i, true);
+                        break;
+                    }
+                }
+            }
+            DemoListMsg::SelectAll => {
+                self.list_selection.select_all();
             }
         }
     }
