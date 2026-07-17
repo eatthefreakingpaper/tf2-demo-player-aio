@@ -36,3 +36,6 @@ cargo build
 in the project root.
 
 On windows the easiest way to build it is using MSYS2, by installing the mingw versions of gtk4 and libadwaita there and then running `package_win.sh` within it. This produces a "pack" folder that contains all the files needed for the program to run outside of msys.
+
+## License
+This repo is MIT licensed, but bundles a vendored copy of [demo-analysis](https://github.com/Nocrex/demo-analysis) (see `demo-analysis/`) for cheat-detection algorithms. demo-analysis is GPLv3-licensed, and since it's compiled directly into the `tf2-demo-player` binary, distributed builds of this program are a combined work and must comply with GPLv3 (in addition to this repo's own MIT terms) as a whole.
