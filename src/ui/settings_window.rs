@@ -24,6 +24,15 @@ pub enum PreferencesMsg {
     CheatAlgoParamFloat(String, String, f32),
     CheatAlgoParamInt(String, String, i32),
     CheatAlgoParamBool(String, String, bool),
+    CheatAnalysisThreads(f64),
+
+    ProfileLoadRequest,
+    ProfileLoad(String),
+    ProfileSaveAsRequest,
+    ProfileSaveAs(String),
+    ProfileImportRequest,
+    ProfileImport(String),
+    ProfileExport,
 }
 
 #[derive(Debug)]
@@ -37,6 +46,7 @@ pub struct PreferencesModel {
     settings: Settings,
     connection_test_msg: String,
     connection_test_active: bool,
+    profile_status: String,
 }
 
 #[derive(Debug)]
@@ -175,6 +185,82 @@ impl Component for PreferencesModel {
                 set_title: "Cheat Detection",
 
                 adw::PreferencesGroup {
+                    set_title: "Performance",
+
+                    adw::SpinRow {
+                        set_title: "Analysis threads",
+                        set_subtitle: "Number of threads used to run detection algorithms concurrently",
+                        set_digits: 0,
+                        #[wrap(Some)]
+                        set_adjustment = &gtk::Adjustment {
+                            set_lower: 1.0,
+                            set_upper: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64,
+                            set_page_increment: 1.0,
+                            set_step_increment: 1.0,
+                            set_value: model.settings.cheat_analysis_threads as f64,
+                            connect_value_changed[sender] => move |adj| {
+                                sender.input(PreferencesMsg::CheatAnalysisThreads(adj.value()));
+                            },
+                        }
+                    },
+                },
+
+                adw::PreferencesGroup {
+                    set_title: "Profiles",
+                    set_description: Some("Save, load, import, and export sets of algorithm parameters."),
+
+                    adw::ActionRow {
+                        set_title: "Status",
+                        set_subtitle_selectable: true,
+                        #[watch]
+                        set_visible: !model.profile_status.is_empty(),
+                        #[watch]
+                        set_subtitle: &model.profile_status,
+                    },
+
+                    #[name = "profile_dropdown"]
+                    adw::ComboRow {
+                        set_title: "Profile",
+                        add_suffix = &gtk::Button {
+                            set_valign: gtk::Align::Center,
+                            set_label: "Load",
+                            connect_clicked => PreferencesMsg::ProfileLoadRequest,
+                        }
+                    },
+
+                    adw::ActionRow {
+                        set_title: "Save current parameters",
+                        set_activatable_widget: Some(&save_as_button),
+                        add_suffix: save_as_button = &gtk::Button {
+                            set_valign: gtk::Align::Center,
+                            set_label: "Save As...",
+                            connect_clicked => PreferencesMsg::ProfileSaveAsRequest,
+                        }
+                    },
+
+                    adw::ActionRow {
+                        set_title: "Import from pasted config",
+                        set_activatable_widget: Some(&import_button),
+                        add_suffix: import_button = &gtk::Button {
+                            set_valign: gtk::Align::Center,
+                            set_label: "Import...",
+                            connect_clicked => PreferencesMsg::ProfileImportRequest,
+                        }
+                    },
+
+                    adw::ActionRow {
+                        set_title: "Export current parameters",
+                        set_subtitle: "Copies the config to your clipboard",
+                        set_activatable_widget: Some(&export_button),
+                        add_suffix: export_button = &gtk::Button {
+                            set_valign: gtk::Align::Center,
+                            set_label: "Export",
+                            connect_clicked => PreferencesMsg::ProfileExport,
+                        }
+                    },
+                },
+
+                adw::PreferencesGroup {
                     set_title: "Detection Algorithms",
                     set_description: Some("Enable/disable algorithms and tune their thresholds. Changes take effect on the next scan."),
 
@@ -198,11 +284,13 @@ impl Component for PreferencesModel {
             parent,
             connection_test_msg: "".to_owned(),
             connection_test_active: false,
+            profile_status: "".to_owned(),
         };
 
         let widgets = view_output!();
 
         Self::build_cheat_algo_rows(&widgets.cheat_algo_list, &model.settings, &sender);
+        Self::set_profile_dropdown_model(&widgets.profile_dropdown, &crate::cheat_profiles::list_profiles());
 
         ComponentParts { model, widgets }
     }
@@ -237,6 +325,9 @@ impl Component for PreferencesModel {
             PreferencesMsg::EventSkipOffset(off) => self.settings.event_skip_predelay = off as f32,
             PreferencesMsg::RConPassword(pass) => self.settings.rcon_pw = pass,
             PreferencesMsg::RConPort(port) => self.settings.rcon_port = port as u16,
+            PreferencesMsg::CheatAnalysisThreads(threads) => {
+                self.settings.cheat_analysis_threads = (threads as usize).max(1)
+            }
             PreferencesMsg::TF2FolderPath => {
                 let dia = gtk::FileDialog::new();
                 let initial = self
@@ -281,7 +372,156 @@ impl Component for PreferencesModel {
                     .or_default()
                     .insert(param, Parameter::Bool(value));
             }
+            PreferencesMsg::ProfileSaveAsRequest => {
+                let entry = gtk::Entry::new();
+                let ad = adw::AlertDialog::builder()
+                    .default_response("save")
+                    .close_response("cancel")
+                    .extra_child(&entry)
+                    .body("Name for this profile")
+                    .heading("Save Profile")
+                    .build();
+                ad.add_response("cancel", "Cancel");
+                ad.add_response("save", "Save");
+                ad.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+                entry.grab_focus();
+                let sender = sender.clone();
+                ad.choose(root, None::<&gtk::gio::Cancellable>, move |resp| {
+                    if resp == "save" {
+                        let name = entry.text().as_str().trim().to_owned();
+                        if !name.is_empty() {
+                            sender.input(PreferencesMsg::ProfileSaveAs(name));
+                        }
+                    }
+                });
+            }
+            // Translated into `ProfileLoad(name)` in `update_with_view` before reaching here.
+            PreferencesMsg::ProfileLoadRequest => {}
+            PreferencesMsg::ProfileImportRequest => {
+                let text_view = gtk::TextView::new();
+                text_view.set_wrap_mode(gtk::WrapMode::WordChar);
+                text_view.set_monospace(true);
+                text_view.set_top_margin(6);
+                text_view.set_bottom_margin(6);
+                text_view.set_left_margin(6);
+                text_view.set_right_margin(6);
+                let scroller = gtk::ScrolledWindow::new();
+                scroller.set_child(Some(&text_view));
+                scroller.set_min_content_height(200);
+                scroller.set_min_content_width(400);
+                scroller.add_css_class("card");
+                let buffer = text_view.buffer();
+                let ad = adw::AlertDialog::builder()
+                    .default_response("import")
+                    .close_response("cancel")
+                    .extra_child(&scroller)
+                    .body("Paste a cheat detection config below (backticks are ignored)")
+                    .heading("Import Profile")
+                    .build();
+                ad.add_response("cancel", "Cancel");
+                ad.add_response("import", "Import");
+                ad.set_response_appearance("import", adw::ResponseAppearance::Suggested);
+                let sender = sender.clone();
+                ad.choose(root, None::<&gtk::gio::Cancellable>, move |resp| {
+                    if resp == "import" {
+                        let start = buffer.start_iter();
+                        let end = buffer.end_iter();
+                        let text = buffer.text(&start, &end, false).to_string();
+                        sender.input(PreferencesMsg::ProfileImport(text));
+                    }
+                });
+            }
+            PreferencesMsg::ProfileExport => {
+                match crate::cheat_profiles::export_text(&self.settings.cheat_algo_params) {
+                    Ok(text) => {
+                        if let Some(display) = gtk::gdk::Display::default() {
+                            display.clipboard().set_text(&text);
+                        }
+                        self.profile_status = "Copied current parameters to clipboard".to_owned();
+                    }
+                    Err(e) => {
+                        self.profile_status = format!("Export failed: {e}");
+                    }
+                }
+            }
+            PreferencesMsg::ProfileLoad(name) => match crate::cheat_profiles::load_profile(&name) {
+                Ok(config) => {
+                    self.settings.cheat_algo_params = config;
+                    self.profile_status = format!("Loaded profile \"{name}\"");
+                }
+                Err(e) => {
+                    self.profile_status = format!("Failed to load \"{name}\": {e}");
+                }
+            },
+            PreferencesMsg::ProfileSaveAs(name) => {
+                match crate::cheat_profiles::save_profile(&name, &self.settings.cheat_algo_params) {
+                    Ok(()) => {
+                        self.profile_status = format!("Saved profile \"{name}\"");
+                    }
+                    Err(e) => {
+                        self.profile_status = format!("Failed to save \"{name}\": {e}");
+                    }
+                }
+            }
+            PreferencesMsg::ProfileImport(text) => match crate::cheat_profiles::import_text(&text) {
+                Ok(config) => {
+                    self.settings.cheat_algo_params = config;
+                    self.profile_status = "Imported profile from pasted config".to_owned();
+                }
+                Err(e) => {
+                    self.profile_status = format!("Import failed: {e}");
+                }
+            },
         }
+    }
+
+    fn update_with_view(
+        &mut self,
+        widgets: &mut Self::Widgets,
+        message: Self::Input,
+        sender: ComponentSender<Self>,
+        root: &Self::Root,
+    ) {
+        let message = match message {
+            PreferencesMsg::ProfileLoadRequest => {
+                let selected = widgets
+                    .profile_dropdown
+                    .selected_item()
+                    .and_then(|i| i.downcast::<gtk::StringObject>().ok());
+                match selected {
+                    Some(s) => PreferencesMsg::ProfileLoad(s.string().to_string()),
+                    None => {
+                        self.profile_status = "No profile selected".to_owned();
+                        self.update_view(widgets, sender);
+                        return;
+                    }
+                }
+            }
+            other => other,
+        };
+
+        let rebuild_algos = matches!(
+            message,
+            PreferencesMsg::ProfileLoad(_) | PreferencesMsg::ProfileImport(_)
+        );
+        let rebuild_profiles = matches!(message, PreferencesMsg::ProfileSaveAs(_));
+
+        self.update(message, sender.clone(), root);
+
+        if rebuild_algos {
+            while let Some(row) = widgets.cheat_algo_list.row_at_index(0) {
+                widgets.cheat_algo_list.remove(&row);
+            }
+            Self::build_cheat_algo_rows(&widgets.cheat_algo_list, &self.settings, &sender);
+        }
+        if rebuild_profiles {
+            Self::set_profile_dropdown_model(
+                &widgets.profile_dropdown,
+                &crate::cheat_profiles::list_profiles(),
+            );
+        }
+
+        self.update_view(widgets, sender);
     }
 
     fn update_cmd(
@@ -310,6 +550,11 @@ impl Component for PreferencesModel {
 }
 
 impl PreferencesModel {
+    fn set_profile_dropdown_model(dropdown: &adw::ComboRow, names: &[String]) {
+        let items: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        dropdown.set_model(Some(&gtk::StringList::new(&items)));
+    }
+
     fn build_cheat_algo_rows(list: &gtk::ListBox, settings: &Settings, sender: &ComponentSender<Self>) {
         for mut algo in get_algorithms()
             .into_iter()

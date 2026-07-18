@@ -398,6 +398,7 @@ impl AsyncComponent for ControlsModel {
                     demo_clone,
                     settings.cheat_algo_enabled.clone(),
                     settings.cheat_algo_params.clone(),
+                    settings.cheat_analysis_threads,
                 ));
             }
             ControlsMsg::CheatersChecked(dem) => {

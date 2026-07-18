@@ -153,17 +153,20 @@ impl Demo {
         Ok(players)
     }
 
-    pub async fn detect_cheaters(
+    pub fn detect_cheaters(
         &mut self,
         enabled_overrides: &HashMap<String, bool>,
         param_overrides: &demo_analysis::lib::parameters::Config,
+        threads: usize,
+        progress_cb: impl Fn(u32, u32) + Sync,
     ) -> Result<Arc<Vec<demo_analysis::lib::algorithm::Detection>>> {
         let detections = crate::cheat_analysis::analyse_demo(
             self.path.clone(),
             enabled_overrides.clone(),
             param_overrides.clone(),
-        )
-        .await?;
+            threads,
+            progress_cb,
+        )?;
         self.cheat_detections = Some(Arc::new(detections));
         Ok(self.cheat_detections.as_ref().unwrap().clone())
     }
@@ -371,20 +374,28 @@ impl DemoManager {
             progress_cb(completed, total);
         });
         for demo in self.demos.values() {
-            self.cache.entry(demo.path.clone()).or_insert(demo.clone());
+            self.cache
+                .entry(demo.path.clone())
+                .or_insert_with(|| demo.clone());
         }
         pollster::block_on(self.update_cache());
     }
 
     pub fn index_players(&mut self, progress_cb: impl Fn(usize, usize, f32) + Sync) {
-        let total = self.demos.values().filter(|d| d.players.is_none()).count();
+        let to_index: std::collections::HashSet<String> = self
+            .demos
+            .iter()
+            .filter(|(_, d)| d.players.is_none())
+            .map(|(name, _)| name.clone())
+            .collect();
+        let total = to_index.len();
         let start = std::time::Instant::now();
         let ticks_done = AtomicU64::new(0);
         let done = AtomicUsize::new(0);
         progress_cb(0, total, 0.0);
         self.demos
             .par_iter_mut()
-            .filter(|(_, d)| d.players.is_none())
+            .filter(|(name, _)| to_index.contains(*name))
             .for_each(|(_, demo)| {
                 if let Err(e) = pollster::block_on(demo.index_players()) {
                     log::warn!("Failed to index players for {}: {}", demo.filename, e);
@@ -402,8 +413,10 @@ impl DemoManager {
                 };
                 progress_cb(completed, total, tps);
             });
-        for demo in self.demos.values() {
-            self.cache.insert(demo.path.clone(), demo.clone());
+        for name in &to_index {
+            if let Some(demo) = self.demos.get(name) {
+                self.cache.insert(demo.path.clone(), demo.clone());
+            }
         }
         pollster::block_on(self.update_cache());
     }

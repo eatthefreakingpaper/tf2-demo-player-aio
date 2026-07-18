@@ -102,7 +102,7 @@ impl Gui {
             send.send((|| -> anyhow::Result<CheatAnalyser<'static>> {
                 let file = std::fs::read(&file)?;
                 let demo: Demo = Demo::new(&file);
-                Ok(analyse(&demo, algorithms)?)
+                Ok(analyse(&demo, algorithms, |_, _| {})?)
             })())
             .unwrap();
         });

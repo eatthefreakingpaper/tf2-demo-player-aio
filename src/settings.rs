@@ -21,6 +21,8 @@ pub struct Settings {
     pub cheat_algo_enabled: HashMap<String, bool>,
     // Overrides for `CheatAlgorithm::params()`; missing algorithms/params use their own defaults.
     pub cheat_algo_params: demo_analysis::lib::parameters::Config,
+    // Number of threads used to run cheat detection algorithms concurrently.
+    pub cheat_analysis_threads: usize,
 
     #[serde(skip)]
     pub first_launch: bool,
@@ -43,6 +45,9 @@ impl Default for Settings {
 
             cheat_algo_enabled: HashMap::new(),
             cheat_algo_params: HashMap::new(),
+            cheat_analysis_threads: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
 
             first_launch: false,
         }

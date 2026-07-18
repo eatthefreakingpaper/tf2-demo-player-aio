@@ -60,9 +60,14 @@ pub fn apply_config<'a>(algorithms: &mut [Box<dyn CheatAlgorithm<'a> + Send>], c
     }
 }
 
-pub fn analyse<'a>(demo: &Demo, algorithms: Vec<Box<dyn CheatAlgorithm<'a> + Send>>) -> anyhow::Result<CheatAnalyser<'a>> {
+pub fn analyse<'a>(
+    demo: &Demo,
+    algorithms: Vec<Box<dyn CheatAlgorithm<'a> + Send>>,
+    mut progress_cb: impl FnMut(u32, u32),
+) -> anyhow::Result<CheatAnalyser<'a>> {
     let mut stream = demo.get_stream();
     let header: Header = Header::read(&mut stream)?;
+    let total_ticks = header.ticks;
     let mut packets = RawPacketStream::new(stream);
 
     let analyser = CheatAnalyser::new(algorithms);
@@ -82,10 +87,63 @@ pub fn analyse<'a>(demo: &Demo, algorithms: Vec<Box<dyn CheatAlgorithm<'a> + Sen
                 continue;
             }
         };
+        progress_cb(packet.tick().into(), total_ticks);
         let _ = handler.handle_packet(packet)?;
     }
     let _ = handler.analyser.finish()?;
     Ok(handler.analyser)
+}
+
+// Runs independent algorithms concurrently, each re-parsing its own copy of the demo stream.
+// State-building is inherently sequential per pass, so parallelism comes from running separate
+// algorithm chunks side by side rather than splitting a single pass across threads.
+// Takes the raw demo bytes (rather than a `Demo`) because `Demo` wraps a `bitbuffer::Data` enum
+// that can hold an `Rc`, making it `!Sync`; a `&[u8]` can be shared across scope threads safely.
+pub fn analyse_multithreaded<'a>(
+    demo_bytes: &[u8],
+    algorithms: Vec<Box<dyn CheatAlgorithm<'a> + Send>>,
+    threads: usize,
+    progress_cb: impl Fn(u32, u32) + Sync,
+) -> anyhow::Result<CheatAnalyser<'a>> {
+    let threads = threads.max(1).min(algorithms.len().max(1));
+    if threads <= 1 {
+        let demo = Demo::new(demo_bytes);
+        return analyse(&demo, algorithms, |current, total| progress_cb(current, total));
+    }
+
+    let mut chunks: Vec<Vec<Box<dyn CheatAlgorithm<'a> + Send>>> =
+        (0..threads).map(|_| Vec::new()).collect();
+    for (i, algorithm) in algorithms.into_iter().enumerate() {
+        chunks[i % threads].push(algorithm);
+    }
+    chunks.retain(|c| !c.is_empty());
+
+    let results: Vec<anyhow::Result<CheatAnalyser<'a>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                let progress_cb = &progress_cb;
+                scope.spawn(move || {
+                    let demo = Demo::new(demo_bytes);
+                    analyse(&demo, chunk, |current, total| progress_cb(current, total))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("analysis thread panicked"))
+            .collect()
+    });
+
+    let mut merged: Option<CheatAnalyser<'a>> = None;
+    for result in results {
+        let analyser = result?;
+        match &mut merged {
+            Some(m) => m.detections.extend(analyser.detections),
+            None => merged = Some(analyser),
+        }
+    }
+    Ok(merged.expect("at least one chunk"))
 }
 
 pub trait CheatAlgorithm<'a> {

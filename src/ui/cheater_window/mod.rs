@@ -14,8 +14,43 @@ use super::util;
 pub struct CheaterModel {
     demo: Demo,
     loading: bool,
+    progress: (u32, u32),
+    tps: f32,
+    threads: usize,
     player_count: usize,
     player_rows: FactoryVecDeque<CheaterRowModel>,
+}
+
+impl CheaterModel {
+    fn progress_text(&self) -> String {
+        let (current, total) = self.progress;
+        if total == 0 {
+            return "Starting up...".to_string();
+        }
+        let eta = if self.tps > 0.0 {
+            format_duration((total.saturating_sub(current)) as f32 / self.tps)
+        } else {
+            "…".to_string()
+        };
+        let threads = if self.threads == 1 {
+            "1 background thread".to_string()
+        } else {
+            format!("{} background threads", self.threads)
+        };
+        format!(
+            "tick {}/{} ({:.0} ticks/sec) - ETA {} - {}",
+            current, total, self.tps, eta, threads
+        )
+    }
+}
+
+fn format_duration(seconds: f32) -> String {
+    let seconds = seconds.max(0.0).round() as u32;
+    if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 #[derive(Debug)]
@@ -24,6 +59,7 @@ pub enum CheaterMsg {
         Demo,
         HashMap<String, bool>,
         demo_analysis::lib::parameters::Config,
+        usize,
     ),
 }
 
@@ -33,12 +69,18 @@ pub enum CheaterOut {
     DemoChecked(Demo),
 }
 
+#[derive(Debug)]
+pub enum CheaterCmd {
+    Progress(u32, u32, f32),
+    Done(Result<(Vec<Detection>, HashMap<u64, String>)>),
+}
+
 #[relm4::component(pub)]
 impl Component for CheaterModel {
     type Init = ();
     type Input = CheaterMsg;
     type Output = CheaterOut;
-    type CommandOutput = Result<(Vec<Detection>, HashMap<u64, String>)>;
+    type CommandOutput = CheaterCmd;
 
     view! {
         adw::Window {
@@ -71,7 +113,6 @@ impl Component for CheaterModel {
                                 set_orientation: gtk::Orientation::Vertical,
                                 gtk::Label {
                                     set_margin_top: 10,
-                                    set_margin_bottom: 10,
                                     add_css_class: "title-3",
                                     #[watch]
                                     set_label: &if model.loading {
@@ -81,6 +122,15 @@ impl Component for CheaterModel {
                                     } else {
                                         format!("{} player(s) flagged", model.player_count)
                                     },
+                                },
+                                gtk::Label {
+                                    set_margin_bottom: 10,
+                                    add_css_class: "dim-label",
+                                    add_css_class: "caption",
+                                    #[watch]
+                                    set_visible: model.loading,
+                                    #[watch]
+                                    set_label: &model.progress_text(),
                                 },
                                 model.player_rows.widget() -> &gtk::ListBox {
                                     set_margin_bottom: 50,
@@ -103,6 +153,11 @@ impl Component for CheaterModel {
         let model = CheaterModel {
             demo: Demo::new(Path::new("empty")),
             loading: false,
+            progress: (0, 0),
+            tps: 0.0,
+            threads: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
             player_count: 0,
             player_rows: FactoryVecDeque::builder().launch_default().forward(
                 sender.output_sender(),
@@ -119,24 +174,42 @@ impl Component for CheaterModel {
 
     fn update(&mut self, message: Self::Input, sender: ComponentSender<Self>, root: &Self::Root) {
         match message {
-            CheaterMsg::Check(demo, enabled_overrides, param_overrides) => {
+            CheaterMsg::Check(demo, enabled_overrides, param_overrides, threads) => {
                 self.demo = demo;
                 self.player_rows.guard().clear();
                 self.player_count = 0;
                 self.loading = true;
+                self.progress = (0, 0);
+                self.tps = 0.0;
+                self.threads = threads.max(1);
                 let mut dem = self.demo.clone();
-                sender.oneshot_command(async move {
-                    let detections = dem
-                        .detect_cheaters(&enabled_overrides, &param_overrides)
-                        .await?;
-                    let detections = (*detections).clone();
-                    // Make sure we have names to show alongside each flagged SteamID. The
-                    // detection pass doesn't collect usernames, so scrape the player list
-                    // here if it wasn't already indexed.
-                    if dem.players.is_none() {
-                        let _ = dem.index_players().await;
-                    }
-                    Ok((detections, build_name_lookup(&dem)))
+                sender.spawn_command(move |s| {
+                    let start = std::time::Instant::now();
+                    let result: Result<(Vec<Detection>, HashMap<u64, String>)> = (|| {
+                        let detections = dem.detect_cheaters(
+                            &enabled_overrides,
+                            &param_overrides,
+                            threads,
+                            |current, total| {
+                                let elapsed = start.elapsed().as_secs_f32();
+                                let tps = if elapsed > 0.0 {
+                                    current as f32 / elapsed
+                                } else {
+                                    0.0
+                                };
+                                s.emit(CheaterCmd::Progress(current, total, tps));
+                            },
+                        )?;
+                        let detections = (*detections).clone();
+                        // Make sure we have names to show alongside each flagged SteamID. The
+                        // detection pass doesn't collect usernames, so scrape the player list
+                        // here if it wasn't already indexed.
+                        if dem.players.is_none() {
+                            let _ = pollster::block_on(dem.index_players());
+                        }
+                        Ok((detections, build_name_lookup(&dem)))
+                    })();
+                    s.emit(CheaterCmd::Done(result));
                 });
                 root.present();
             }
@@ -149,16 +222,25 @@ impl Component for CheaterModel {
         sender: ComponentSender<Self>,
         root: &Self::Root,
     ) {
-        self.loading = false;
         let (detections, name_lookup) = match message {
-            Ok(d) => d,
-            Err(e) => {
-                util::notice_dialog(
-                    &root,
-                    "An error occured while analysing the demo",
-                    &e.to_string(),
-                );
+            CheaterCmd::Progress(current, total, tps) => {
+                self.progress = (current, total);
+                self.tps = tps;
                 return;
+            }
+            CheaterCmd::Done(result) => {
+                self.loading = false;
+                match result {
+                    Ok(d) => d,
+                    Err(e) => {
+                        util::notice_dialog(
+                            &root,
+                            "An error occured while analysing the demo",
+                            &e.to_string(),
+                        );
+                        return;
+                    }
+                }
             }
         };
 

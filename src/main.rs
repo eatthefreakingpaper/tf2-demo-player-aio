@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod analyser;
 mod cheat_analysis;
+mod cheat_profiles;
 mod demo_manager;
 mod demo_strip;
 mod rcon_manager;

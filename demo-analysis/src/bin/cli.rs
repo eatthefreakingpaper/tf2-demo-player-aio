@@ -119,7 +119,7 @@ fn main() -> Result<(), Error> {
 
     let file = fs::read(demo_path)?;
     let demo: Demo = Demo::new(&file);
-    let analyser = analyse(&demo, algorithms)?;
+    let analyser = analyse(&demo, algorithms, |_, _| {})?;
 
     if start.elapsed().as_secs() >= 10 {
         analyser.print_metadata();
