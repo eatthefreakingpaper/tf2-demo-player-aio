@@ -23,6 +23,9 @@ pub struct Settings {
     pub cheat_algo_params: demo_analysis::lib::parameters::Config,
     // Number of threads used to run cheat detection algorithms concurrently.
     pub cheat_analysis_threads: usize,
+    // Name of the last profile selected in the Cheat Detection settings, so the dropdown
+    // selection is restored across sessions.
+    pub last_selected_profile: Option<String>,
 
     #[serde(skip)]
     pub first_launch: bool,
@@ -48,6 +51,7 @@ impl Default for Settings {
             cheat_analysis_threads: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),
+            last_selected_profile: None,
 
             first_launch: false,
         }

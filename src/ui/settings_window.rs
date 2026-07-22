@@ -70,7 +70,7 @@ impl Component for PreferencesModel {
             },
 
             add = &adw::PreferencesPage {
-                set_icon_name: Some(&"preferences-system-symbolic"),
+                set_icon_name: Some(relm4_icons::icon_names::SETTINGS),
                 set_title: "General",
 
                 adw::PreferencesGroup {
@@ -181,7 +181,7 @@ impl Component for PreferencesModel {
             },
 
             add = &adw::PreferencesPage {
-                set_icon_name: Some("security-high-symbolic"),
+                set_icon_name: Some(relm4_icons::icon_names::SHIELD_SAFE),
                 set_title: "Cheat Detection",
 
                 adw::PreferencesGroup {
@@ -290,7 +290,11 @@ impl Component for PreferencesModel {
         let widgets = view_output!();
 
         Self::build_cheat_algo_rows(&widgets.cheat_algo_list, &model.settings, &sender);
-        Self::set_profile_dropdown_model(&widgets.profile_dropdown, &crate::cheat_profiles::list_profiles());
+        Self::set_profile_dropdown_model(
+            &widgets.profile_dropdown,
+            &crate::cheat_profiles::list_profiles(),
+            model.settings.last_selected_profile.as_deref(),
+        );
 
         ComponentParts { model, widgets }
     }
@@ -457,6 +461,7 @@ impl Component for PreferencesModel {
                 match crate::cheat_profiles::save_profile(&name, &self.settings.cheat_algo_params) {
                     Ok(()) => {
                         self.profile_status = format!("Saved profile \"{name}\"");
+                        self.settings.last_selected_profile = Some(name);
                     }
                     Err(e) => {
                         self.profile_status = format!("Failed to save \"{name}\": {e}");
@@ -497,6 +502,16 @@ impl Component for PreferencesModel {
                     }
                 }
             }
+            PreferencesMsg::Close => {
+                if let Some(item) = widgets
+                    .profile_dropdown
+                    .selected_item()
+                    .and_then(|i| i.downcast::<gtk::StringObject>().ok())
+                {
+                    self.settings.last_selected_profile = Some(item.string().to_string());
+                }
+                PreferencesMsg::Close
+            }
             other => other,
         };
 
@@ -518,6 +533,7 @@ impl Component for PreferencesModel {
             Self::set_profile_dropdown_model(
                 &widgets.profile_dropdown,
                 &crate::cheat_profiles::list_profiles(),
+                self.settings.last_selected_profile.as_deref(),
             );
         }
 
@@ -550,9 +566,14 @@ impl Component for PreferencesModel {
 }
 
 impl PreferencesModel {
-    fn set_profile_dropdown_model(dropdown: &adw::ComboRow, names: &[String]) {
+    fn set_profile_dropdown_model(dropdown: &adw::ComboRow, names: &[String], selected: Option<&str>) {
         let items: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         dropdown.set_model(Some(&gtk::StringList::new(&items)));
+        if let Some(name) = selected {
+            if let Some(index) = names.iter().position(|n| n == name) {
+                dropdown.set_selected(index as u32);
+            }
+        }
     }
 
     fn build_cheat_algo_rows(list: &gtk::ListBox, settings: &Settings, sender: &ComponentSender<Self>) {
