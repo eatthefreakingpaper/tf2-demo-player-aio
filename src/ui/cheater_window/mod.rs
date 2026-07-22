@@ -12,10 +12,36 @@ use crate::demo_manager::Demo;
 use super::util;
 
 lazy_static::lazy_static! {
-    static ref CAT_TEXTURE: gtk::gdk::Texture = gtk::gdk::Texture::from_bytes(
-        &gtk::glib::Bytes::from(include_bytes!("../../img/20250222_201432.jpg")),
-    )
-    .expect("Failed to load embedded cat image");
+    static ref CAT_TEXTURES: Vec<gtk::gdk::Texture> = vec![
+        gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from(include_bytes!(
+            "../../img/20230304_155528.jpg"
+        )))
+        .expect("Failed to load embedded cat image"),
+        gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from(include_bytes!(
+            "../../img/20230425_141804.jpg"
+        )))
+        .expect("Failed to load embedded cat image"),
+        gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from(include_bytes!(
+            "../../img/20230708_112152.jpg"
+        )))
+        .expect("Failed to load embedded cat image"),
+        gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from(include_bytes!(
+            "../../img/20240915_024957.jpg"
+        )))
+        .expect("Failed to load embedded cat image"),
+        gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from(include_bytes!(
+            "../../img/20250222_201432.jpg"
+        )))
+        .expect("Failed to load embedded cat image"),
+        gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from(include_bytes!(
+            "../../img/20250307_142736.png"
+        )))
+        .expect("Failed to load embedded cat image"),
+        gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from(include_bytes!(
+            "../../img/20260705_032144.jpg"
+        )))
+        .expect("Failed to load embedded cat image"),
+    ];
 }
 
 pub struct CheaterModel {
@@ -25,6 +51,7 @@ pub struct CheaterModel {
     tps: f32,
     threads: usize,
     player_count: usize,
+    cat_index: usize,
     player_rows: FactoryVecDeque<CheaterRowModel>,
 }
 
@@ -133,7 +160,8 @@ impl Component for CheaterModel {
                                 gtk::Picture {
                                     #[watch]
                                     set_visible: !model.loading && model.player_count == 0,
-                                    set_paintable: Some(&*CAT_TEXTURE),
+                                    #[watch]
+                                    set_paintable: Some(&CAT_TEXTURES[model.cat_index]),
                                     set_content_fit: gtk::ContentFit::Contain,
                                     set_halign: gtk::Align::Center,
                                     set_margin_top: 10,
@@ -176,6 +204,7 @@ impl Component for CheaterModel {
                 .map(|n| n.get())
                 .unwrap_or(1),
             player_count: 0,
+            cat_index: rand::random::<usize>() % CAT_TEXTURES.len(),
             player_rows: FactoryVecDeque::builder().launch_default().forward(
                 sender.output_sender(),
                 |m| match m {
@@ -195,6 +224,7 @@ impl Component for CheaterModel {
                 self.demo = demo;
                 self.player_rows.guard().clear();
                 self.player_count = 0;
+                self.cat_index = rand::random::<usize>() % CAT_TEXTURES.len();
                 self.loading = true;
                 self.progress = (0, 0);
                 self.tps = 0.0;
