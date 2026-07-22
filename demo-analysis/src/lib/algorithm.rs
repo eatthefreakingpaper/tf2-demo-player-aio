@@ -103,12 +103,12 @@ pub fn analyse_multithreaded<'a>(
     demo_bytes: &[u8],
     algorithms: Vec<Box<dyn CheatAlgorithm<'a> + Send>>,
     threads: usize,
-    progress_cb: impl Fn(u32, u32) + Sync,
+    progress_cb: impl Fn(usize, u32, u32) + Sync,
 ) -> anyhow::Result<CheatAnalyser<'a>> {
     let threads = threads.max(1).min(algorithms.len().max(1));
     if threads <= 1 {
         let demo = Demo::new(demo_bytes);
-        return analyse(&demo, algorithms, |current, total| progress_cb(current, total));
+        return analyse(&demo, algorithms, |current, total| progress_cb(0, current, total));
     }
 
     let mut chunks: Vec<Vec<Box<dyn CheatAlgorithm<'a> + Send>>> =
@@ -121,11 +121,12 @@ pub fn analyse_multithreaded<'a>(
     let results: Vec<anyhow::Result<CheatAnalyser<'a>>> = std::thread::scope(|scope| {
         let handles: Vec<_> = chunks
             .into_iter()
-            .map(|chunk| {
+            .enumerate()
+            .map(|(i, chunk)| {
                 let progress_cb = &progress_cb;
                 scope.spawn(move || {
                     let demo = Demo::new(demo_bytes);
-                    analyse(&demo, chunk, |current, total| progress_cb(current, total))
+                    analyse(&demo, chunk, |current, total| progress_cb(i, current, total))
                 })
             })
             .collect();

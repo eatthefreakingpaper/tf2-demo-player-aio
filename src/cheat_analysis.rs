@@ -9,7 +9,7 @@ pub fn analyse_demo(
     enabled_overrides: HashMap<String, bool>,
     param_overrides: Config,
     threads: usize,
-    progress_cb: impl Fn(u32, u32) + Sync,
+    progress_cb: impl Fn(usize, u32, u32) + Sync,
 ) -> Result<Vec<Detection>> {
     let file = std::fs::read(&path)?;
 

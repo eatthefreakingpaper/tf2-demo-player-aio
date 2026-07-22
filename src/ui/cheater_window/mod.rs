@@ -229,22 +229,41 @@ impl Component for CheaterModel {
                 self.progress = (0, 0);
                 self.tps = 0.0;
                 self.threads = threads.max(1);
+                let effective_threads = self.threads;
                 let mut dem = self.demo.clone();
                 sender.spawn_command(move |s| {
                     let start = std::time::Instant::now();
+                    // Track each analysis thread's latest tick so the reported progress reflects
+                    // the *slowest* thread rather than whichever happens to report last. Without
+                    // this, a fast thread (lighter algorithms) can make the ETA look almost done
+                    // while heavier algorithms are still far behind.
+                    // Initialized to MAX so threads that don't exist (fewer algorithms than
+                    // threads) don't drag the minimum down.
+                    let thread_ticks: Vec<std::sync::atomic::AtomicU32> = (0..effective_threads)
+                        .map(|_| std::sync::atomic::AtomicU32::new(u32::MAX))
+                        .collect();
+                    let thread_ticks = std::sync::Arc::new(thread_ticks);
                     let result: Result<(Vec<Detection>, HashMap<u64, String>)> = (|| {
                         let detections = dem.detect_cheaters(
                             &enabled_overrides,
                             &param_overrides,
                             threads,
-                            |current, total| {
+                            |thread_idx, current, total| {
+                                thread_ticks[thread_idx].store(current, std::sync::atomic::Ordering::Relaxed);
+                                // Effective progress = the slowest thread's position.
+                                let min_current = thread_ticks
+                                    .iter()
+                                    .map(|t| t.load(std::sync::atomic::Ordering::Relaxed))
+                                    .filter(|&v| v != u32::MAX)
+                                    .min()
+                                    .unwrap_or(current);
                                 let elapsed = start.elapsed().as_secs_f32();
-                                let tps = if elapsed > 0.0 {
-                                    current as f32 / elapsed
+                                let tps = if elapsed > 0.0 && min_current > 0 {
+                                    min_current as f32 / elapsed
                                 } else {
                                     0.0
                                 };
-                                s.emit(CheaterCmd::Progress(current, total, tps));
+                                s.emit(CheaterCmd::Progress(min_current, total, tps));
                             },
                         )?;
                         let detections = (*detections).clone();
