@@ -11,6 +11,13 @@ use crate::demo_manager::Demo;
 
 use super::util;
 
+lazy_static::lazy_static! {
+    static ref CAT_TEXTURE: gtk::gdk::Texture = gtk::gdk::Texture::from_bytes(
+        &gtk::glib::Bytes::from(include_bytes!("../../img/20250222_201432.jpg")),
+    )
+    .expect("Failed to load embedded cat image");
+}
+
 pub struct CheaterModel {
     demo: Demo,
     loading: bool,
@@ -118,10 +125,20 @@ impl Component for CheaterModel {
                                     set_label: &if model.loading {
                                         "Analysing demo...".to_string()
                                     } else if model.player_count == 0 {
-                                        "No suspicious activity detected".to_string()
+                                        "No suspicious activity detected :(".to_string()
                                     } else {
                                         format!("{} player(s) flagged", model.player_count)
                                     },
+                                },
+                                gtk::Picture {
+                                    #[watch]
+                                    set_visible: !model.loading && model.player_count == 0,
+                                    set_paintable: Some(&*CAT_TEXTURE),
+                                    set_content_fit: gtk::ContentFit::Contain,
+                                    set_halign: gtk::Align::Center,
+                                    set_margin_top: 10,
+                                    set_margin_bottom: 10,
+                                    set_size_request: (300, 300),
                                 },
                                 gtk::Label {
                                     set_margin_bottom: 10,
