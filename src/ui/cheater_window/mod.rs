@@ -4,12 +4,13 @@ use adw::prelude::*;
 use anyhow::Result;
 use async_std::path::Path;
 use demo_analysis::lib::algorithm::Detection;
-use itertools::Itertools;
 use relm4::{gtk::glib::markup_escape_text, prelude::*};
 
 use crate::demo_manager::Demo;
 
 use super::util;
+
+mod detail;
 
 lazy_static::lazy_static! {
     static ref CAT_TEXTURES: Vec<gtk::gdk::Texture> = vec![
@@ -53,6 +54,9 @@ pub struct CheaterModel {
     player_count: usize,
     cat_index: usize,
     player_rows: FactoryVecDeque<CheaterRowModel>,
+    // Held so "Copy all detections" can hand over every detection's detail, including the ones
+    // past the on-screen row cap.
+    report: String,
 }
 
 impl CheaterModel {
@@ -95,6 +99,7 @@ pub enum CheaterMsg {
         demo_analysis::lib::parameters::Config,
         usize,
     ),
+    CopyAll,
 }
 
 #[derive(Debug)]
@@ -133,6 +138,13 @@ impl Component for CheaterModel {
                     pack_start = &gtk::Spinner {
                         #[watch]
                         set_spinning: model.loading,
+                    },
+                    pack_end = &gtk::Button {
+                        set_label: "Copy all detections",
+                        set_tooltip_text: Some("Copy every flagged player and the full detail of each detection"),
+                        #[watch]
+                        set_visible: !model.loading && model.player_count > 0,
+                        connect_clicked => CheaterMsg::CopyAll,
                     }
                 },
                 #[wrap(Some)]
@@ -205,6 +217,7 @@ impl Component for CheaterModel {
                 .unwrap_or(1),
             player_count: 0,
             cat_index: rand::random::<usize>() % CAT_TEXTURES.len(),
+            report: String::new(),
             player_rows: FactoryVecDeque::builder().launch_default().forward(
                 sender.output_sender(),
                 |m| match m {
@@ -225,6 +238,7 @@ impl Component for CheaterModel {
                 self.player_rows.guard().clear();
                 self.player_count = 0;
                 self.cat_index = rand::random::<usize>() % CAT_TEXTURES.len();
+                self.report.clear();
                 self.loading = true;
                 self.progress = (0, 0);
                 self.tps = 0.0;
@@ -279,6 +293,14 @@ impl Component for CheaterModel {
                 });
                 root.present();
             }
+            CheaterMsg::CopyAll => {
+                if self.report.is_empty() {
+                    return;
+                }
+                if let Some(display) = gtk::gdk::Display::default() {
+                    display.clipboard().set_text(&self.report);
+                }
+            }
         }
     }
 
@@ -320,15 +342,20 @@ impl Component for CheaterModel {
 
         self.player_count = players.len();
 
+        let mut report_rows: Vec<(u64, Option<String>, Vec<Detection>)> = Vec::new();
         let mut guard = self.player_rows.guard();
         for (steamid64, mut dets) in players {
             dets.sort_by_key(|d| d.tick);
+            let name = name_lookup.get(&steamid64).cloned();
+            report_rows.push((steamid64, name.clone(), dets.clone()));
             guard.push_back(CheaterRowInit {
                 steamid64,
-                name: name_lookup.get(&steamid64).cloned(),
+                name,
                 detections: dets,
             });
         }
+        drop(guard);
+        self.report = detail::full_report(&self.demo.filename, &report_rows);
 
         let _ = sender.output(CheaterOut::DemoChecked(self.demo.clone()));
     }
@@ -380,13 +407,34 @@ struct CheaterRowModel {
     steamid64: u64,
     name: Option<String>,
     detections: Vec<Detection>,
+    detection_rows: FactoryVecDeque<DetectionRowModel>,
+    hidden_detections: usize,
+}
+
+// A player with thousands of flagged ticks would otherwise build thousands of expander rows up
+// front. Only the on-screen list is capped - the clipboard report always carries every detection.
+const MAX_DETECTION_ROWS: usize = 200;
+
+impl CheaterRowModel {
+    fn subtitle(&self) -> String {
+        if self.hidden_detections == 0 {
+            return format!("{} detection(s)", self.detections.len());
+        }
+        format!(
+            "{} detection(s) - showing the first {}, use Copy detections for the rest",
+            self.detections.len(),
+            MAX_DETECTION_ROWS
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
 enum CheaterRowMsg {
     CopySteamId,
+    CopyDetections,
     OpenProfile,
     OpenSteamhistory,
+    GotoTick(u32),
 }
 
 #[derive(Debug)]
@@ -410,7 +458,7 @@ impl FactoryComponent for CheaterRowModel {
                 Some(n) if !n.is_empty() => format!("{} ({})", self.steamid64, n),
                 _ => self.steamid64.to_string(),
             }),
-            set_subtitle: &format!("{} detection(s)", self.detections.len()),
+            set_subtitle: &self.subtitle(),
             add_row = &gtk::CenterBox {
                 #[wrap(Some)]
                 set_center_widget = &gtk::Box {
@@ -419,6 +467,12 @@ impl FactoryComponent for CheaterRowModel {
                         set_label: "Copy SteamID",
                         set_has_frame: false,
                         connect_clicked => CheaterRowMsg::CopySteamId,
+                    },
+                    gtk::Button {
+                        set_label: "Copy detections",
+                        set_has_frame: false,
+                        set_tooltip_text: Some("Copy this player's detections with the full detail of each one"),
+                        connect_clicked => CheaterRowMsg::CopyDetections,
                     },
                     gtk::Button {
                         set_label: "Profile",
@@ -432,42 +486,54 @@ impl FactoryComponent for CheaterRowModel {
                     },
                 }
             },
-            add_row = &adw::ActionRow {
-                set_title: "Detections",
-                add_suffix = &gtk::Label {
-                    set_margin_top: 10,
-                    set_margin_bottom: 10,
-                    set_selectable: true,
-                    set_focusable: false,
-                    set_wrap: true,
-                    set_justify: gtk::Justification::Right,
-                    set_use_markup: true,
-                    set_label: &self.detections.iter()
-                        .map(|d| format!("<a href=\"{0}\">{0}</a>: {1}", d.tick, markup_escape_text(&d.algorithm)))
-                        .join("\n"),
-                    connect_activate_link[sender] => move |_, tick| {
-                        let _ = sender.output(CheaterRowOut::GotoTick(tick.parse().unwrap()));
-                        gtk::glib::Propagation::Stop
-                    },
-                }
+            add_row = self.detection_rows.widget() -> &gtk::ListBox {
+                set_selection_mode: gtk::SelectionMode::None,
             },
         }
     }
 
-    fn init_model(init: Self::Init, _index: &Self::Index, _sender: FactorySender<Self>) -> Self {
+    fn init_model(init: Self::Init, _index: &Self::Index, sender: FactorySender<Self>) -> Self {
+        let mut detection_rows = FactoryVecDeque::builder().launch_default().forward(
+            sender.input_sender(),
+            |m| match m {
+                DetectionRowOut::GotoTick(t) => CheaterRowMsg::GotoTick(t),
+            },
+        );
+        {
+            let mut guard = detection_rows.guard();
+            for detection in init.detections.iter().take(MAX_DETECTION_ROWS) {
+                guard.push_back(detection.clone());
+            }
+        }
+        let hidden_detections = init.detections.len().saturating_sub(MAX_DETECTION_ROWS);
+
         Self {
             steamid64: init.steamid64,
             name: init.name,
             detections: init.detections,
+            detection_rows,
+            hidden_detections,
         }
     }
 
-    fn update(&mut self, message: Self::Input, _sender: FactorySender<Self>) {
+    fn update(&mut self, message: Self::Input, sender: FactorySender<Self>) {
         match message {
             CheaterRowMsg::CopySteamId => {
                 if let Some(display) = gtk::gdk::Display::default() {
                     display.clipboard().set_text(&self.steamid64.to_string());
                 }
+            }
+            CheaterRowMsg::CopyDetections => {
+                if let Some(display) = gtk::gdk::Display::default() {
+                    display.clipboard().set_text(&detail::player_report(
+                        self.steamid64,
+                        self.name.as_deref(),
+                        &self.detections,
+                    ));
+                }
+            }
+            CheaterRowMsg::GotoTick(tick) => {
+                let _ = sender.output(CheaterRowOut::GotoTick(tick));
             }
             CheaterRowMsg::OpenProfile => {
                 if let Err(e) = opener::open_browser(format!(
@@ -484,6 +550,74 @@ impl FactoryComponent for CheaterRowModel {
                 )) {
                     log::warn!("Failed to open browser, {e}");
                 }
+            }
+        }
+    }
+}
+
+// One flagged tick. Collapsed it shows the algorithm and a gist of the numbers; expanded it shows
+// the algorithm's whole payload, which is what actually justifies the flag.
+struct DetectionRowModel {
+    detection: Detection,
+}
+
+#[derive(Debug, Clone)]
+enum DetectionRowMsg {
+    GotoTick,
+}
+
+#[derive(Debug)]
+enum DetectionRowOut {
+    GotoTick(u32),
+}
+
+#[relm4::factory]
+impl FactoryComponent for DetectionRowModel {
+    type ParentWidget = gtk::ListBox;
+    type CommandOutput = ();
+    type Input = DetectionRowMsg;
+    type Output = DetectionRowOut;
+    type Init = Detection;
+
+    view! {
+        #[root]
+        adw::ExpanderRow {
+            set_title: &markup_escape_text(&format!("tick {}", self.detection.tick)),
+            set_subtitle: &markup_escape_text(&format!(
+                "{} - {}",
+                self.detection.algorithm,
+                detail::summary(&self.detection.data)
+            )),
+            add_suffix = &gtk::Button {
+                set_label: "Go to tick",
+                set_has_frame: false,
+                set_valign: gtk::Align::Center,
+                connect_clicked => DetectionRowMsg::GotoTick,
+            },
+            add_row = &adw::ActionRow {
+                add_prefix = &gtk::Label {
+                    set_margin_top: 6,
+                    set_margin_bottom: 6,
+                    set_margin_start: 12,
+                    set_selectable: true,
+                    set_focusable: false,
+                    set_wrap: true,
+                    set_xalign: 0.0,
+                    add_css_class: "monospace",
+                    set_label: &detail::detail_block(&self.detection.data),
+                }
+            },
+        }
+    }
+
+    fn init_model(init: Self::Init, _index: &Self::Index, _sender: FactorySender<Self>) -> Self {
+        Self { detection: init }
+    }
+
+    fn update(&mut self, message: Self::Input, sender: FactorySender<Self>) {
+        match message {
+            DetectionRowMsg::GotoTick => {
+                let _ = sender.output(DetectionRowOut::GotoTick(self.detection.tick));
             }
         }
     }
