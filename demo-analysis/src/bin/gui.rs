@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use analysis_template::{
+use demo_analysis::{
     base::cheat_analyser_base::CheatAnalyser,
     lib::{
         algorithm::{analyse, get_algorithms, Detection},
@@ -234,8 +234,8 @@ impl eframe::App for Gui {
                 ui.horizontal(|ui|{
                     ui.spinner();
                     ui.label("Analysing...");
-                    let progress = analysis_template::PROGRESS_CURRENT.load(std::sync::atomic::Ordering::Relaxed);
-                    let total = analysis_template::PROGRESS_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+                    let progress = demo_analysis::PROGRESS_CURRENT.load(std::sync::atomic::Ordering::Relaxed);
+                    let total = demo_analysis::PROGRESS_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
                     ui.add(egui::widgets::ProgressBar::new(progress as f32 / total as f32).show_percentage().text(format!("{} / {}", progress, total)));
                 });
             }

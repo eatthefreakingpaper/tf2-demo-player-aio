@@ -85,6 +85,29 @@ pub async fn check_new_version() -> Result<Option<String>> {
     anyhow::bail!("Couldn't parse tag version");
 }
 
+// Folder the app keeps its own files in (settings, detection profiles).
+// These used to be plain relative paths, which resolve against the working directory - launching
+// through a shortcut or from another folder meant reading a different settings.json than the one
+// that got written, so changes looked like they never stuck. The executable's folder is stable
+// no matter how the app is started; the working directory is only a fallback for the odd case
+// where the exe path can't be read.
+pub fn app_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+// Resolves one of the app's own files against `app_dir`, but keeps using a copy that already
+// exists in the working directory so an existing install doesn't look wiped after this change.
+pub fn app_file(name: &str) -> std::path::PathBuf {
+    let legacy = std::path::PathBuf::from(name);
+    if legacy.exists() {
+        return legacy;
+    }
+    app_dir().join(name)
+}
+
 pub mod steam {
 
     pub fn tf_folder() -> Option<std::path::PathBuf> {

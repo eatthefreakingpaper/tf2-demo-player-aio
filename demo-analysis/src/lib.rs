@@ -39,7 +39,7 @@ pub static PROGRESS_TOTAL: AtomicU32 = AtomicU32::new(0);
 #[macro_export]
 macro_rules! dev_print {
     ($($arg:tt)*) => {
-        if !crate::SILENT.load(std::sync::atomic::Ordering::Relaxed) {
+        if !$crate::SILENT.load(std::sync::atomic::Ordering::Relaxed) {
             println!($($arg)*);
         }
     }

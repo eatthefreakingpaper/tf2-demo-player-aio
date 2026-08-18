@@ -1,7 +1,10 @@
 use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};
+use demo_analysis::lib::algorithm::{effective_config, normalize_config};
 use demo_analysis::lib::parameters::Config;
+
+use crate::util;
 
 const PROFILES_DIR: &str = "cdconfigs";
 
@@ -12,14 +15,19 @@ const BUILTIN_PROFILES: &[(&str, &str)] = &[
     ("idke", include_str!("../cdconfigs/idke.cfg")),
 ];
 
+fn profiles_dir() -> PathBuf {
+    util::app_file(PROFILES_DIR)
+}
+
 fn profile_path(name: &str) -> PathBuf {
-    PathBuf::from(PROFILES_DIR).join(format!("{name}.cfg"))
+    profiles_dir().join(format!("{name}.cfg"))
 }
 
 // Writes any missing bundled profiles to disk without touching ones the user already has/edited.
 fn seed_default_profiles() {
-    if let Err(e) = fs::create_dir_all(PROFILES_DIR) {
-        log::warn!("Couldn't create {PROFILES_DIR} folder, {e}");
+    let dir = profiles_dir();
+    if let Err(e) = fs::create_dir_all(&dir) {
+        log::warn!("Couldn't create {} folder, {e}", dir.display());
         return;
     }
     for (name, contents) in BUILTIN_PROFILES {
@@ -34,7 +42,7 @@ fn seed_default_profiles() {
 
 pub fn list_profiles() -> Vec<String> {
     seed_default_profiles();
-    let mut names: Vec<String> = fs::read_dir(PROFILES_DIR)
+    let mut names: Vec<String> = fs::read_dir(profiles_dir())
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
@@ -55,28 +63,56 @@ pub fn list_profiles() -> Vec<String> {
     names
 }
 
-pub fn save_profile(name: &str, config: &Config) -> Result<()> {
+// Profiles are written as the full parameter set, not just the values that differ from the
+// built-in defaults. A profile holding only your edits is empty on a fresh install, so saving and
+// then loading it appeared to do nothing at all.
+pub fn save_profile(name: &str, overrides: &Config) -> Result<()> {
     let name = sanitize_name(name)?;
-    fs::create_dir_all(PROFILES_DIR)?;
-    let json = serde_json::to_string_pretty(config)?;
-    fs::write(profile_path(&name), json)?;
+    let dir = profiles_dir();
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("Couldn't create {} folder", dir.display()))?;
+    let json = serde_json::to_string_pretty(&effective_config(overrides))?;
+    fs::write(profile_path(&name), json)
+        .with_context(|| format!("Couldn't write profile '{name}'"))?;
     Ok(())
 }
 
-pub fn load_profile(name: &str) -> Result<Config> {
+// Returns the profile's parameters along with notes about anything in the file that no algorithm
+// recognises, so a profile that matches nothing reports that instead of loading as a no-op.
+pub fn load_profile(name: &str) -> Result<(Config, Vec<String>)> {
     let content = fs::read_to_string(profile_path(name))
         .with_context(|| format!("Couldn't read profile '{name}'"))?;
-    serde_json::from_str(&content).with_context(|| format!("Couldn't parse profile '{name}'"))
+    // strip_fences also drops a leading byte order mark, which editors on Windows like to add.
+    let config: Config = serde_json::from_str(strip_fences(&content))
+        .with_context(|| format!("Couldn't parse profile '{name}'"))?;
+    Ok(normalize_config(&config))
 }
 
-pub fn export_text(config: &Config) -> Result<String> {
-    let json = serde_json::to_string_pretty(config)?;
+pub fn export_text(overrides: &Config) -> Result<String> {
+    let json = serde_json::to_string_pretty(&effective_config(overrides))?;
     Ok(format!("```\n{json}\n```"))
 }
 
-pub fn import_text(text: &str) -> Result<Config> {
-    let cleaned: String = text.chars().filter(|c| *c != '`').collect();
-    serde_json::from_str(cleaned.trim()).context("Couldn't parse pasted config")
+pub fn import_text(text: &str) -> Result<(Config, Vec<String>)> {
+    let config: Config = serde_json::from_str(strip_fences(text)).context(
+        "Couldn't parse pasted config, it needs to be JSON like {\"nocrex/aimsnap\": {\"noise_max\": 2.5}}",
+    )?;
+    let (config, warnings) = normalize_config(&config);
+    if config.is_empty() {
+        anyhow::bail!("Pasted config didn't contain any parameters this build knows about");
+    }
+    Ok((config, warnings))
+}
+
+// Pasted configs usually arrive wrapped in a markdown code fence, sometimes with a language tag
+// on the opening line. Drop the fences and anything outside the outermost JSON object.
+fn strip_fences(text: &str) -> &str {
+    let text = text.trim().trim_matches('`').trim();
+    let text = text.strip_prefix("json").unwrap_or(text).trim();
+    match (text.find('{'), text.rfind('}')) {
+        (Some(start), Some(end)) if end > start => &text[start..=end],
+        _ => text,
+    }
 }
 
 fn sanitize_name(name: &str) -> Result<String> {

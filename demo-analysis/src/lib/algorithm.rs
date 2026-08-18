@@ -42,7 +42,9 @@ pub fn get_algorithms() -> Vec<Box<dyn CheatAlgorithm<'static> + Send>> {
 }
 
 // Overrides each algorithm's default parameters with any matching values found in `config`.
-// Unknown algorithm/parameter names in `config` (e.g. from a stale save) are ignored.
+// Unknown algorithm/parameter names in `config` (e.g. from a stale save) are ignored, and values
+// are reshaped to the kind the algorithm declares so a config written by hand (`20` instead of
+// `20.0`) still applies instead of blowing up when the algorithm reads it back.
 pub fn apply_config<'a>(algorithms: &mut [Box<dyn CheatAlgorithm<'a> + Send>], config: &Config) {
     for algorithm in algorithms.iter_mut() {
         let name = algorithm.algorithm_name().to_string();
@@ -54,10 +56,82 @@ pub fn apply_config<'a>(algorithms: &mut [Box<dyn CheatAlgorithm<'a> + Send>], c
         };
         for (param_name, value) in overrides {
             if let Some(param) = params.get_mut(param_name) {
-                *param = value.clone();
+                if let Some(coerced) = value.coerced_like(param) {
+                    *param = coerced;
+                }
             }
         }
     }
+}
+
+// Every algorithm's built-in parameters, as a complete config.
+// This is what the settings UI shows before you touch anything, so it's also what an exported or
+// saved profile has to be built from - a profile holding only the values you happened to edit
+// looks empty to whoever loads it.
+pub fn default_config() -> Config {
+    let mut config = Config::new();
+    for mut algorithm in get_algorithms() {
+        let name = algorithm.algorithm_name().to_string();
+        if let Some(params) = algorithm.params() {
+            config.insert(name, params.clone());
+        }
+    }
+    config
+}
+
+// `defaults` with `overrides` laid on top: the parameter set an analysis run would actually use.
+pub fn effective_config(overrides: &Config) -> Config {
+    let mut config = default_config();
+    for (algorithm, params) in config.iter_mut() {
+        let Some(algo_overrides) = overrides.get(algorithm) else {
+            continue;
+        };
+        for (param_name, value) in algo_overrides {
+            if let Some(param) = params.get_mut(param_name) {
+                if let Some(coerced) = value.coerced_like(param) {
+                    *param = coerced;
+                }
+            }
+        }
+    }
+    config
+}
+
+// Checks a config that came from outside (a .cfg file, a pasted blob) against the algorithms that
+// actually exist. Returns the config with every value reshaped to its algorithm's declared kind,
+// plus a human-readable note for anything that had to be dropped - importing a config that
+// silently matches nothing is the same as importing nothing at all.
+pub fn normalize_config(config: &Config) -> (Config, Vec<String>) {
+    let defaults = default_config();
+    let mut normalized = Config::new();
+    let mut warnings = Vec::new();
+
+    for (algorithm, params) in config {
+        let Some(default_params) = defaults.get(algorithm) else {
+            warnings.push(format!("unknown algorithm \"{algorithm}\""));
+            continue;
+        };
+        let mut kept = Parameters::new();
+        for (param_name, value) in params {
+            let Some(default_value) = default_params.get(param_name) else {
+                warnings.push(format!("unknown parameter \"{algorithm}/{param_name}\""));
+                continue;
+            };
+            match value.coerced_like(default_value) {
+                Some(coerced) => {
+                    kept.insert(param_name.clone(), coerced);
+                }
+                None => warnings.push(format!(
+                    "\"{algorithm}/{param_name}\" has the wrong type for this parameter"
+                )),
+            }
+        }
+        if !kept.is_empty() {
+            normalized.insert(algorithm.clone(), kept);
+        }
+    }
+
+    (normalized, warnings)
 }
 
 pub fn analyse<'a>(
@@ -132,7 +206,10 @@ pub fn analyse_multithreaded<'a>(
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().expect("analysis thread panicked"))
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("an analysis thread panicked")))
+            })
             .collect()
     });
 
@@ -205,4 +282,132 @@ pub struct Detection {
     pub algorithm: String,
     pub player: u64,
     pub data: Value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lib::parameters::{get_parameter_value, Parameter};
+
+    fn config_of(algorithm: &str, param: &str, value: Parameter) -> Config {
+        let mut params = Parameters::new();
+        params.insert(param.to_string(), value);
+        let mut config = Config::new();
+        config.insert(algorithm.to_string(), params);
+        config
+    }
+
+    // Every algorithm has to be able to read every one of its own parameters back. This is the
+    // panic that used to take a whole scan down: get_parameter_value unwraps the type conversion.
+    #[test]
+    fn defaults_round_trip_through_every_algorithm() {
+        let defaults = default_config();
+        assert!(!defaults.is_empty(), "no algorithm exposed any parameters");
+        for mut algorithm in get_algorithms() {
+            let name = algorithm.algorithm_name().to_string();
+            let Some(params) = algorithm.params() else {
+                continue;
+            };
+            for (param_name, value) in params.clone() {
+                match value {
+                    Parameter::Float(_) => {
+                        get_parameter_value::<f32>(params, &param_name);
+                    }
+                    Parameter::Int(_) => {
+                        get_parameter_value::<i32>(params, &param_name);
+                    }
+                    Parameter::Bool(_) => {
+                        get_parameter_value::<bool>(params, &param_name);
+                    }
+                }
+            }
+            assert!(defaults.contains_key(&name), "{name} missing from defaults");
+        }
+    }
+
+    // The original bug: a float parameter written as `20` landed in the algorithm as an Int, and
+    // the algorithm's own read of it panicked mid-analysis.
+    #[test]
+    fn int_written_for_a_float_parameter_stays_readable() {
+        let mut algorithms = get_algorithms();
+        let target = algorithms
+            .iter_mut()
+            .find_map(|a| {
+                let name = a.algorithm_name().to_string();
+                let params = a.params()?;
+                let param = params
+                    .iter()
+                    .find(|(_, v)| matches!(v, Parameter::Float(_)))?
+                    .0
+                    .clone();
+                Some((name, param))
+            })
+            .expect("no algorithm has a float parameter to test with");
+        let (algorithm_name, param_name) = target;
+
+        let config = config_of(&algorithm_name, &param_name, Parameter::Int(20));
+        apply_config(&mut algorithms, &config);
+
+        let applied = algorithms
+            .iter_mut()
+            .find(|a| a.algorithm_name() == algorithm_name)
+            .and_then(|a| a.params())
+            .unwrap();
+        assert_eq!(applied[&param_name], Parameter::Float(20.0));
+        // Would have panicked before the fix.
+        assert_eq!(get_parameter_value::<f32>(applied, &param_name), 20.0);
+    }
+
+    #[test]
+    fn normalize_reports_what_it_dropped() {
+        let mut config = config_of("nope/not_an_algorithm", "x", Parameter::Int(1));
+        let real = default_config();
+        let (algorithm_name, params) = real.iter().next().unwrap();
+        let param_name = params.keys().next().unwrap();
+        config.insert(algorithm_name.clone(), {
+            let mut p = Parameters::new();
+            p.insert(param_name.clone(), params[param_name].clone());
+            p.insert("not_a_parameter".to_string(), Parameter::Int(1));
+            p
+        });
+
+        let (normalized, warnings) = normalize_config(&config);
+        assert!(!normalized.contains_key("nope/not_an_algorithm"));
+        assert!(normalized[algorithm_name].contains_key(param_name));
+        assert!(!normalized[algorithm_name].contains_key("not_a_parameter"));
+        assert_eq!(warnings.len(), 2, "warnings were {warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("not_an_algorithm")));
+        assert!(warnings.iter().any(|w| w.contains("not_a_parameter")));
+    }
+
+    // A profile saved from an untouched install used to hold nothing, so loading it did nothing.
+    #[test]
+    fn effective_config_is_complete_even_with_no_overrides() {
+        let effective = effective_config(&Config::new());
+        assert_eq!(effective, default_config());
+        assert!(effective.values().any(|p| !p.is_empty()));
+    }
+
+    #[test]
+    fn effective_config_lays_overrides_on_top() {
+        let defaults = default_config();
+        let (algorithm_name, params) = defaults
+            .iter()
+            .find(|(_, p)| p.values().any(|v| matches!(v, Parameter::Float(_))))
+            .expect("no float parameter anywhere");
+        let param_name = params
+            .iter()
+            .find(|(_, v)| matches!(v, Parameter::Float(_)))
+            .unwrap()
+            .0;
+
+        let config = config_of(algorithm_name, param_name, Parameter::Float(123.5));
+        let effective = effective_config(&config);
+        assert_eq!(effective[algorithm_name][param_name], Parameter::Float(123.5));
+        // Untouched parameters survive.
+        assert_eq!(effective.len(), defaults.len());
+        for (name, params) in &defaults {
+            assert_eq!(effective[name].len(), params.len());
+        }
+    }
 }

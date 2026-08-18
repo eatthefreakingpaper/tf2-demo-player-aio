@@ -33,6 +33,7 @@ pub enum PreferencesMsg {
     ProfileImportRequest,
     ProfileImport(String),
     ProfileExport,
+    ProfileReset,
 }
 
 #[derive(Debug)]
@@ -258,6 +259,18 @@ impl Component for PreferencesModel {
                             connect_clicked => PreferencesMsg::ProfileExport,
                         }
                     },
+
+                    adw::ActionRow {
+                        set_title: "Reset parameters",
+                        set_subtitle: "Puts every algorithm back on its built-in values",
+                        set_activatable_widget: Some(&reset_button),
+                        add_suffix: reset_button = &gtk::Button {
+                            set_valign: gtk::Align::Center,
+                            set_label: "Reset",
+                            add_css_class: "destructive-action",
+                            connect_clicked => PreferencesMsg::ProfileReset,
+                        }
+                    },
                 },
 
                 adw::PreferencesGroup {
@@ -449,9 +462,14 @@ impl Component for PreferencesModel {
                 }
             }
             PreferencesMsg::ProfileLoad(name) => match crate::cheat_profiles::load_profile(&name) {
-                Ok(config) => {
+                Ok((config, warnings)) => {
+                    let algorithms = config.len();
                     self.settings.cheat_algo_params = config;
-                    self.profile_status = format!("Loaded profile \"{name}\"");
+                    self.settings.last_selected_profile = Some(name.clone());
+                    self.profile_status = format!(
+                        "Loaded profile \"{name}\" ({algorithms} algorithms){}",
+                        Self::warning_suffix(&warnings)
+                    );
                 }
                 Err(e) => {
                     self.profile_status = format!("Failed to load \"{name}\": {e}");
@@ -469,14 +487,22 @@ impl Component for PreferencesModel {
                 }
             }
             PreferencesMsg::ProfileImport(text) => match crate::cheat_profiles::import_text(&text) {
-                Ok(config) => {
+                Ok((config, warnings)) => {
+                    let algorithms = config.len();
                     self.settings.cheat_algo_params = config;
-                    self.profile_status = "Imported profile from pasted config".to_owned();
+                    self.profile_status = format!(
+                        "Imported parameters for {algorithms} algorithms{}",
+                        Self::warning_suffix(&warnings)
+                    );
                 }
                 Err(e) => {
                     self.profile_status = format!("Import failed: {e}");
                 }
             },
+            PreferencesMsg::ProfileReset => {
+                self.settings.cheat_algo_params.clear();
+                self.profile_status = "Reset every algorithm to its built-in parameters".to_owned();
+            }
         }
     }
 
@@ -502,24 +528,19 @@ impl Component for PreferencesModel {
                     }
                 }
             }
-            PreferencesMsg::Close => {
-                if let Some(item) = widgets
-                    .profile_dropdown
-                    .selected_item()
-                    .and_then(|i| i.downcast::<gtk::StringObject>().ok())
-                {
-                    self.settings.last_selected_profile = Some(item.string().to_string());
-                }
-                PreferencesMsg::Close
-            }
             other => other,
         };
 
         let rebuild_algos = matches!(
             message,
-            PreferencesMsg::ProfileLoad(_) | PreferencesMsg::ProfileImport(_)
+            PreferencesMsg::ProfileLoad(_)
+                | PreferencesMsg::ProfileImport(_)
+                | PreferencesMsg::ProfileReset
         );
-        let rebuild_profiles = matches!(message, PreferencesMsg::ProfileSaveAs(_));
+        let rebuild_profiles = matches!(
+            message,
+            PreferencesMsg::ProfileSaveAs(_) | PreferencesMsg::ProfileLoad(_)
+        );
 
         self.update(message, sender.clone(), root);
 
@@ -576,6 +597,20 @@ impl PreferencesModel {
         }
     }
 
+    // Appends "(N entries ignored: ...)" to a status line so a profile that only half matches
+    // this build says so instead of quietly loading less than you asked for.
+    fn warning_suffix(warnings: &[String]) -> String {
+        if warnings.is_empty() {
+            return String::new();
+        }
+        let shown = warnings.iter().take(3).join(", ");
+        if warnings.len() > 3 {
+            format!(" - ignored {}, and {} more", shown, warnings.len() - 3)
+        } else {
+            format!(" - ignored {shown}")
+        }
+    }
+
     fn build_cheat_algo_rows(list: &gtk::ListBox, settings: &Settings, sender: &ComponentSender<Self>) {
         for mut algo in get_algorithms()
             .into_iter()
@@ -611,17 +646,22 @@ impl PreferencesModel {
                 .unwrap_or_default();
             if let Some(params) = algo.params() {
                 for (param_name, default_value) in params.iter().sorted_by_key(|p| p.0.clone()) {
+                    // The widget kind always follows the algorithm's own declaration, never the
+                    // kind the config happened to be written in. A config with `20` where the
+                    // algorithm wants a float would otherwise turn the row into a whole-number
+                    // spinner you couldn't put a decimal into.
                     let value = overrides
                         .get(param_name)
-                        .cloned()
+                        .and_then(|v| v.coerced_like(default_value))
                         .unwrap_or_else(|| default_value.clone());
-                    match value {
-                        Parameter::Float(f) => {
+                    match (value, default_value) {
+                        (Parameter::Float(f), Parameter::Float(default)) => {
                             let adjustment = gtk::Adjustment::new(
                                 f as f64, -100000.0, 100000.0, 0.001, 1.0, 0.0,
                             );
-                            let param_row = adw::SpinRow::new(Some(&adjustment), 0.001, 3);
+                            let param_row = adw::SpinRow::new(Some(&adjustment), 0.1, 3);
                             param_row.set_title(param_name);
+                            param_row.set_subtitle(&format!("Default: {default}"));
                             let sender = sender.clone();
                             let algo_name = name.clone();
                             let param_name = param_name.clone();
@@ -634,12 +674,13 @@ impl PreferencesModel {
                             });
                             row.add_row(&param_row);
                         }
-                        Parameter::Int(i) => {
+                        (Parameter::Int(i), Parameter::Int(default)) => {
                             let adjustment = gtk::Adjustment::new(
                                 i as f64, -1000000.0, 1000000.0, 1.0, 10.0, 0.0,
                             );
                             let param_row = adw::SpinRow::new(Some(&adjustment), 1.0, 0);
                             param_row.set_title(param_name);
+                            param_row.set_subtitle(&format!("Default: {default}"));
                             let sender = sender.clone();
                             let algo_name = name.clone();
                             let param_name = param_name.clone();
@@ -652,9 +693,10 @@ impl PreferencesModel {
                             });
                             row.add_row(&param_row);
                         }
-                        Parameter::Bool(b) => {
+                        (Parameter::Bool(b), Parameter::Bool(default)) => {
                             let param_row = adw::SwitchRow::new();
                             param_row.set_title(param_name);
+                            param_row.set_subtitle(&format!("Default: {default}"));
                             param_row.set_active(b);
                             let sender = sender.clone();
                             let algo_name = name.clone();
@@ -668,6 +710,9 @@ impl PreferencesModel {
                             });
                             row.add_row(&param_row);
                         }
+                        // `coerced_like` guarantees the pair matches; nothing sensible to draw
+                        // otherwise.
+                        _ => {}
                     }
                 }
             }

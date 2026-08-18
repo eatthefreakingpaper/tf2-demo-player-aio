@@ -58,12 +58,40 @@ impl Default for Settings {
     }
 }
 
-const SETTINGS_PATH: &str = "settings.json";
+const SETTINGS_FILE: &str = "settings.json";
+
+fn settings_path() -> PathBuf {
+    util::app_file(SETTINGS_FILE)
+}
+
+// Plenty of Windows editors write UTF-8 with a byte order mark, and serde_json treats those
+// three bytes as junk before the opening brace. Hand editing the settings file in one of them
+// would otherwise throw the whole file away on the next launch.
+fn strip_bom(content: &[u8]) -> &[u8] {
+    content.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(content)
+}
 
 impl Settings {
     pub fn load() -> Self {
-        match fs::read(SETTINGS_PATH) {
-            Ok(content) => serde_json::from_slice::<Settings>(&content).unwrap_or_default(),
+        let path = settings_path();
+        match fs::read(&path) {
+            Ok(content) => match serde_json::from_slice::<Settings>(strip_bom(&content)) {
+                Ok(settings) => settings,
+                Err(e) => {
+                    // Falling back to defaults here used to be silent, which looked exactly like
+                    // the app ignoring everything you'd configured. Keep the unreadable file
+                    // around so nothing is lost and the cause is visible in the log.
+                    let backup = path.with_extension("json.bak");
+                    log::error!(
+                        "Settings file at {} couldn't be parsed ({}); falling back to defaults, previous file kept at {}",
+                        path.display(),
+                        e,
+                        backup.display()
+                    );
+                    let _ = fs::rename(&path, &backup);
+                    Settings::default()
+                }
+            },
             Err(e) => {
                 log::warn!("Couldn't load settings file, {}; Creating default", e);
                 let mut s = Settings::default();
@@ -74,8 +102,9 @@ impl Settings {
     }
 
     pub fn save(&self) {
-        if let Err(e) = fs::write(SETTINGS_PATH, serde_json::to_string(self).unwrap()) {
-            log::warn!("Couldn't save settings file, {}", e);
+        let path = settings_path();
+        if let Err(e) = fs::write(&path, serde_json::to_string(self).unwrap()) {
+            log::warn!("Couldn't save settings file to {}, {}", path.display(), e);
         }
     }
 

@@ -1,7 +1,7 @@
-use analysis_template::{
+use demo_analysis::{
     dev_print,
     lib::{
-        algorithm::{analyse, get_algorithms, CheatAlgorithm},
+        algorithm::{analyse, apply_config, get_algorithms, normalize_config, CheatAlgorithm},
         parameters::Parameters,
     },
     SILENT,
@@ -80,27 +80,30 @@ fn main() -> Result<(), Error> {
         let c = fs::read(param_file_path).expect("Couldn't read parameter file");
         let config = serde_json::from_slice::<HashMap<String, Parameters>>(&c)
             .expect("Couldn't decode parameter file");
+
+        // Shared with the GUI so both honour the same rules: unknown names are skipped and
+        // values are reshaped to the kind the algorithm declares (`20` for a float parameter).
+        let (config, warnings) = normalize_config(&config);
+        for warning in &warnings {
+            dev_print!("  ignored: {}", warning);
+        }
+        apply_config(&mut algorithms, &config);
+
         for algo in algorithms.iter_mut() {
             let algorithm_name: String = algo.algorithm_name().to_owned();
-
-            let algo_params = algo.params();
-            if algo_params.is_none() {
+            let overridden = config.get(&algorithm_name).cloned().unwrap_or_default();
+            let Some(algo_params) = algo.params() else {
                 continue;
-            }
-            let algo_params = algo_params.unwrap();
+            };
             dev_print!("  {}", algorithm_name);
-            algo_params.iter_mut().for_each(|(k, v)| {
-                if let Some(config_params) = config.get(&algorithm_name) {
-                    if let Some(param_value) = config_params.get(k) {
-                        *v = param_value.clone();
-                        dev_print!("    {} = {:?} (changed)", k, v);
-                    } else {
-                        dev_print!("    {} = {:?} (default)", k, v);
-                    }
+            for (k, v) in algo_params.iter() {
+                let source = if overridden.contains_key(k) {
+                    "changed"
                 } else {
-                    dev_print!("    {} = {:?} (default)", k, v);
-                }
-            });
+                    "default"
+                };
+                dev_print!("    {} = {:?} ({})", k, v, source);
+            }
         }
     }
 
