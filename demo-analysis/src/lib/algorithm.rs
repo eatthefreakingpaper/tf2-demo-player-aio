@@ -7,10 +7,20 @@ pub use crate::algorithms::{
     angle_history::AngleHistory,
     backtrack::BackTrack,
     double_tap::DoubleTap,
+    triggerbot::TriggerBot,
+    firewindow::FireWindow,
     nocrex:: {
-        aimsnap::AimSnap, 
-        angle_repeat::AngleRepeat, 
+        aimsnap::AimSnap,
+        angle_repeat::AngleRepeat,
         oob_pitch::OOBPitch,
+    },
+    fidoo::{
+        silent_aim::SilentAim,
+        psilent4::Psilent4,
+        nospread::NoSpread,
+        auto_backstab::AutoBackstab,
+        bunnyhop::BunnyHop,
+        invalid_equip_region::InvalidEquipRegion,
     }
 };
 
@@ -38,6 +48,14 @@ pub fn get_algorithms() -> Vec<Box<dyn CheatAlgorithm<'static> + Send>> {
         Box::new(AimSnap::new()),
         Box::new(BackTrack::new()),
         Box::new(DoubleTap::new()),
+        Box::new(TriggerBot::new()),
+        Box::new(FireWindow::new()),
+        Box::new(SilentAim::new()),
+        Box::new(Psilent4::new()),
+        Box::new(NoSpread::new()),
+        Box::new(AutoBackstab::new()),
+        Box::new(BunnyHop::new()),
+        Box::new(InvalidEquipRegion::new()),
     ]
 }
 
