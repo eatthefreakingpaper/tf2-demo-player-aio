@@ -59,6 +59,7 @@ pub enum DemoPlayerMsg {
     ShowSidebar,
     FavoriteFolder,
     SelectAllDemos,
+    QueueCheckSelected,
 
     DemosChanged(bool),
 
@@ -138,6 +139,12 @@ impl AsyncComponent for DemoPlayerModel {
                         set_icon_name: "edit-select-all-symbolic",
                         set_tooltip_text: Some("Select all demos"),
                         connect_clicked => DemoPlayerMsg::SelectAllDemos,
+                    },
+
+                    pack_start = &gtk::Button{
+                        set_icon_name: "system-run-symbolic",
+                        set_tooltip_text: Some("Queue cheater check for the selected demos"),
+                        connect_clicked => DemoPlayerMsg::QueueCheckSelected,
                     },
 
                     pack_end = &adw::SplitButton{
@@ -593,6 +600,24 @@ impl AsyncComponent for DemoPlayerModel {
             }
             DemoPlayerMsg::SelectAllDemos => {
                 self.demo_list.emit(DemoListMsg::SelectAll);
+            }
+            DemoPlayerMsg::QueueCheckSelected => {
+                let selected = self.demo_list.model().get_selected_demos();
+                if selected.is_empty() {
+                    util::notice_dialog(
+                        root,
+                        "No demos selected",
+                        "Select the demos to analyse first (Edit > Select all demos works too).",
+                    );
+                    return;
+                }
+                let dm = self.demo_manager.lock().unwrap();
+                let demos: Vec<Demo> = selected
+                    .iter()
+                    .filter_map(|name| dm.get_demo(name).cloned())
+                    .collect();
+                drop(dm);
+                self.demo_details.emit(InfoPaneMsg::QueueCheckDemos(demos));
             }
             DemoPlayerMsg::CopyDemosToFolder(display_name, demo_names) => 'copy_demos: {
                 let Some(base) = self.settings.borrow().demo_folder_path.clone() else {

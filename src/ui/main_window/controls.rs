@@ -46,6 +46,7 @@ pub enum ControlsMsg {
     DemoInspected(Demo),
     CheckCheaters,
     CheatersChecked(Demo),
+    QueueCheckDemos(Vec<Demo>),
 
     SaveChanges,
     DiscardChanges,
@@ -396,6 +397,18 @@ impl AsyncComponent for ControlsModel {
                 let settings = self.settings.borrow();
                 self.cheater_wnd.emit(CheaterMsg::Check(
                     demo_clone,
+                    settings.cheat_algo_enabled.clone(),
+                    settings.cheat_algo_params.clone(),
+                    settings.cheat_analysis_threads,
+                ));
+            }
+            ControlsMsg::QueueCheckDemos(demos) => {
+                if demos.is_empty() {
+                    return;
+                }
+                let settings = self.settings.borrow();
+                self.cheater_wnd.emit(CheaterMsg::QueueCheck(
+                    demos,
                     settings.cheat_algo_enabled.clone(),
                     settings.cheat_algo_params.clone(),
                     settings.cheat_analysis_threads,

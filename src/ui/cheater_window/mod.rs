@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use adw::prelude::*;
 use anyhow::Result;
 use async_std::path::Path;
+use demo_analysis::algorithms::firewindow::ALGORITHM_NAME as FIREWINDOW_NAME;
+use demo_analysis::algorithms::triggerbot::ALGORITHM_NAME as TRIGGERBOT_NAME;
 use demo_analysis::lib::algorithm::Detection;
 use relm4::{gtk::glib::markup_escape_text, prelude::*};
 
@@ -57,6 +59,20 @@ pub struct CheaterModel {
     // Held so "Copy all detections" can hand over every detection's detail, including the ones
     // past the on-screen row cap.
     report: String,
+
+    // Mass analysis work queue: demos are analysed one at a time, results
+    // accumulate, and more demos can be enqueued while the queue drains.
+    queue: VecDeque<Demo>,
+    // Settings snapshot taken when the current queue session started, so the
+    // next queued demo can be started without the caller re-sending them.
+    queue_settings: Option<(HashMap<String, bool>, demo_analysis::lib::parameters::Config, usize)>,
+    mass_mode: bool,
+    demos_done: usize,
+    demos_total: usize,
+    current_demo: Option<String>,
+    accumulated: Vec<Detection>,
+    name_lookup: HashMap<u64, String>,
+    queue_errors: Vec<(String, String)>,
 }
 
 impl CheaterModel {
@@ -75,10 +91,96 @@ impl CheaterModel {
         } else {
             format!("{} background threads", self.threads)
         };
+        let queue_prefix = if self.mass_mode {
+            format!(
+                "demo {}/{} ({}) - ",
+                self.demos_done + 1,
+                self.demos_total,
+                self.current_demo.as_deref().unwrap_or("?")
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "tick {}/{} ({:.0} ticks/sec) - ETA {} - {}",
+            "{queue_prefix}tick {}/{} ({:.0} ticks/sec) - ETA {} - {}",
             current, total, self.tps, eta, threads
         )
+    }
+
+    fn reset_results(&mut self) {
+        self.player_rows.guard().clear();
+        self.player_count = 0;
+        self.cat_index = rand::random::<usize>() % CAT_TEXTURES.len();
+        self.report.clear();
+        self.accumulated.clear();
+        self.name_lookup.clear();
+        self.queue_errors.clear();
+        self.current_demo = None;
+    }
+
+    // Pops the next demo off the queue and analyses it. Called when a session
+    // starts and again from the Done handler until the queue is empty.
+    fn start_next_demo(&mut self, sender: &ComponentSender<Self>) {
+        let Some(dem) = self.queue.pop_front() else {
+            return;
+        };
+        let Some((enabled_overrides, param_overrides, threads)) = self.queue_settings.clone() else {
+            return;
+        };
+
+        self.current_demo = Some(dem.filename.clone());
+        self.loading = true;
+        self.progress = (0, 0);
+        self.tps = 0.0;
+        self.threads = threads.max(1);
+        let effective_threads = self.threads;
+        let mut dem = dem;
+        sender.clone().spawn_command(move |s| {
+            let start = std::time::Instant::now();
+            // Track each analysis thread's latest tick so the reported progress reflects
+            // the *slowest* thread rather than whichever happens to report last. Without
+            // this, a fast thread (lighter algorithms) can make the ETA look almost done
+            // while heavier algorithms are still far behind.
+            // Initialized to MAX so threads that don't exist (fewer algorithms than
+            // threads) don't drag the minimum down.
+            let thread_ticks: Vec<std::sync::atomic::AtomicU32> = (0..effective_threads)
+                .map(|_| std::sync::atomic::AtomicU32::new(u32::MAX))
+                .collect();
+            let thread_ticks = std::sync::Arc::new(thread_ticks);
+            let result: Result<(Vec<Detection>, HashMap<u64, String>)> = (|| {
+                let detections = dem.detect_cheaters(
+                    &enabled_overrides,
+                    &param_overrides,
+                    threads,
+                    |thread_idx, current, total| {
+                        thread_ticks[thread_idx].store(current, std::sync::atomic::Ordering::Relaxed);
+                        // Effective progress = the slowest thread's position.
+                        let min_current = thread_ticks
+                            .iter()
+                            .map(|t| t.load(std::sync::atomic::Ordering::Relaxed))
+                            .filter(|&v| v != u32::MAX)
+                            .min()
+                            .unwrap_or(current);
+                        let elapsed = start.elapsed().as_secs_f32();
+                        let tps = if elapsed > 0.0 && min_current > 0 {
+                            min_current as f32 / elapsed
+                        } else {
+                            0.0
+                        };
+                        s.emit(CheaterCmd::Progress(min_current, total, tps));
+                    },
+                )?;
+                let detections = (*detections).clone();
+                // Make sure we have names to show alongside each flagged SteamID. The
+                // detection pass doesn't collect usernames, so scrape the player list
+                // here if it wasn't already indexed.
+                if dem.players.is_none() {
+                    let _ = pollster::block_on(dem.index_players());
+                }
+                Ok((detections, build_name_lookup(&dem)))
+            })();
+            s.emit(CheaterCmd::Done(result));
+        });
     }
 }
 
@@ -95,6 +197,12 @@ fn format_duration(seconds: f32) -> String {
 pub enum CheaterMsg {
     Check(
         Demo,
+        HashMap<String, bool>,
+        demo_analysis::lib::parameters::Config,
+        usize,
+    ),
+    QueueCheck(
+        Vec<Demo>,
         HashMap<String, bool>,
         demo_analysis::lib::parameters::Config,
         usize,
@@ -224,6 +332,15 @@ impl Component for CheaterModel {
                     CheaterRowOut::GotoTick(t) => CheaterOut::GotoTick(t),
                 },
             ),
+            queue: VecDeque::new(),
+            queue_settings: None,
+            mass_mode: false,
+            demos_done: 0,
+            demos_total: 0,
+            current_demo: None,
+            accumulated: Vec::new(),
+            name_lookup: HashMap::new(),
+            queue_errors: Vec::new(),
         };
 
         let widgets = view_output!();
@@ -234,63 +351,37 @@ impl Component for CheaterModel {
     fn update(&mut self, message: Self::Input, sender: ComponentSender<Self>, root: &Self::Root) {
         match message {
             CheaterMsg::Check(demo, enabled_overrides, param_overrides, threads) => {
-                self.demo = demo;
-                self.player_rows.guard().clear();
-                self.player_count = 0;
-                self.cat_index = rand::random::<usize>() % CAT_TEXTURES.len();
-                self.report.clear();
-                self.loading = true;
-                self.progress = (0, 0);
-                self.tps = 0.0;
-                self.threads = threads.max(1);
-                let effective_threads = self.threads;
-                let mut dem = self.demo.clone();
-                sender.spawn_command(move |s| {
-                    let start = std::time::Instant::now();
-                    // Track each analysis thread's latest tick so the reported progress reflects
-                    // the *slowest* thread rather than whichever happens to report last. Without
-                    // this, a fast thread (lighter algorithms) can make the ETA look almost done
-                    // while heavier algorithms are still far behind.
-                    // Initialized to MAX so threads that don't exist (fewer algorithms than
-                    // threads) don't drag the minimum down.
-                    let thread_ticks: Vec<std::sync::atomic::AtomicU32> = (0..effective_threads)
-                        .map(|_| std::sync::atomic::AtomicU32::new(u32::MAX))
-                        .collect();
-                    let thread_ticks = std::sync::Arc::new(thread_ticks);
-                    let result: Result<(Vec<Detection>, HashMap<u64, String>)> = (|| {
-                        let detections = dem.detect_cheaters(
-                            &enabled_overrides,
-                            &param_overrides,
-                            threads,
-                            |thread_idx, current, total| {
-                                thread_ticks[thread_idx].store(current, std::sync::atomic::Ordering::Relaxed);
-                                // Effective progress = the slowest thread's position.
-                                let min_current = thread_ticks
-                                    .iter()
-                                    .map(|t| t.load(std::sync::atomic::Ordering::Relaxed))
-                                    .filter(|&v| v != u32::MAX)
-                                    .min()
-                                    .unwrap_or(current);
-                                let elapsed = start.elapsed().as_secs_f32();
-                                let tps = if elapsed > 0.0 && min_current > 0 {
-                                    min_current as f32 / elapsed
-                                } else {
-                                    0.0
-                                };
-                                s.emit(CheaterCmd::Progress(min_current, total, tps));
-                            },
-                        )?;
-                        let detections = (*detections).clone();
-                        // Make sure we have names to show alongside each flagged SteamID. The
-                        // detection pass doesn't collect usernames, so scrape the player list
-                        // here if it wasn't already indexed.
-                        if dem.players.is_none() {
-                            let _ = pollster::block_on(dem.index_players());
-                        }
-                        Ok((detections, build_name_lookup(&dem)))
-                    })();
-                    s.emit(CheaterCmd::Done(result));
-                });
+                self.demo = demo.clone();
+                self.reset_results();
+                self.mass_mode = false;
+                self.queue = VecDeque::from(vec![demo]);
+                self.queue_settings = Some((enabled_overrides, param_overrides, threads));
+                self.demos_total = 1;
+                self.demos_done = 0;
+                self.start_next_demo(&sender);
+                root.present();
+            }
+            CheaterMsg::QueueCheck(demos, enabled_overrides, param_overrides, threads) => {
+                if demos.is_empty() {
+                    return;
+                }
+                if self.loading {
+                    // A queue is already draining: just append and keep going.
+                    self.demos_total += demos.len();
+                    self.queue.extend(demos);
+                } else {
+                    self.demo = demos
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| Demo::new(Path::new("empty")));
+                    self.reset_results();
+                    self.mass_mode = demos.len() > 1;
+                    self.queue = demos.into();
+                    self.queue_settings = Some((enabled_overrides, param_overrides, threads));
+                    self.demos_total = self.queue.len();
+                    self.demos_done = 0;
+                    self.start_next_demo(&sender);
+                }
                 root.present();
             }
             CheaterMsg::CopyAll => {
@@ -310,7 +401,7 @@ impl Component for CheaterModel {
         sender: ComponentSender<Self>,
         root: &Self::Root,
     ) {
-        let (detections, name_lookup) = match message {
+        match message {
             CheaterCmd::Progress(current, total, tps) => {
                 self.progress = (current, total);
                 self.tps = tps;
@@ -318,34 +409,80 @@ impl Component for CheaterModel {
             }
             CheaterCmd::Done(result) => {
                 self.loading = false;
+                let finished_demo = self.current_demo.take().unwrap_or_default();
                 match result {
-                    Ok(d) => d,
+                    Ok((detections, names)) => {
+                        if self.mass_mode {
+                            // Tag every detection with the demo it came from so the
+                            // combined result stays attributable.
+                            let mut detections = detections;
+                            for det in &mut detections {
+                                det.data["demo"] = serde_json::json!(finished_demo);
+                            }
+                            self.accumulated.extend(detections);
+                        } else {
+                            self.accumulated = detections;
+                        }
+                        self.name_lookup.extend(names);
+                    }
                     Err(e) => {
-                        util::notice_dialog(
-                            &root,
-                            "An error occured while analysing the demo",
-                            &e.to_string(),
-                        );
-                        return;
+                        // A demo that fails to analyse shouldn't sink the rest of
+                        // the queue; collect it and keep going.
+                        self.queue_errors.push((finished_demo.clone(), e.to_string()));
+                        if !self.mass_mode {
+                            util::notice_dialog(
+                                &root,
+                                "An error occured while analysing the demo",
+                                &e.to_string(),
+                            );
+                            return;
+                        }
                     }
                 }
-            }
-        };
+                self.demos_done += 1;
 
+                if !self.queue.is_empty() {
+                    self.start_next_demo(&sender);
+                    return;
+                }
+                self.queue_settings = None;
+                self.build_results();
+                if !self.mass_mode {
+                    let _ = sender.output(CheaterOut::DemoChecked(self.demo.clone()));
+                }
+            }
+        }
+    }
+}
+
+impl CheaterModel {
+    // Turns everything the queue accumulated into on-screen rows + the copyable
+    // report. Called once the queue has drained.
+    fn build_results(&mut self) {
+        let name_lookup = &self.name_lookup;
+        let detections = std::mem::take(&mut self.accumulated);
         let mut by_player: HashMap<u64, Vec<Detection>> = HashMap::new();
         for det in detections {
             by_player.entry(det.player).or_default().push(det);
         }
 
         let mut players: Vec<(u64, Vec<Detection>)> = by_player.into_iter().collect();
-        players.sort_by_key(|(_, dets)| std::cmp::Reverse(dets.len()));
+        // The triggerbot input check is the loudest verdict, so players it
+        // flagged sort above everyone else, then by detection count.
+        players.sort_by_key(|(_, dets)| {
+            (
+                std::cmp::Reverse(dets.iter().any(|d| is_triggerbot_alert(d))),
+                std::cmp::Reverse(dets.len()),
+            )
+        });
 
         self.player_count = players.len();
 
         let mut report_rows: Vec<(u64, Option<String>, Vec<Detection>)> = Vec::new();
         let mut guard = self.player_rows.guard();
         for (steamid64, mut dets) in players {
-            dets.sort_by_key(|d| d.tick);
+            // Triggerbot alerts first within each player too, then by tick.
+            dets.sort_by_key(|d| (!is_triggerbot_alert(d), d.tick));
             let name = name_lookup.get(&steamid64).cloned();
             report_rows.push((steamid64, name.clone(), dets.clone()));
             guard.push_back(CheaterRowInit {
@@ -355,14 +492,30 @@ impl Component for CheaterModel {
             });
         }
         drop(guard);
-        self.report = detail::full_report(&self.demo.filename, &report_rows);
-
-        let _ = sender.output(CheaterOut::DemoChecked(self.demo.clone()));
+        let report_title = if self.mass_mode {
+            format!("{} demos", self.demos_total)
+        } else {
+            self.demo.filename.clone()
+        };
+        self.report = detail::full_report(&report_title, &report_rows);
+        if !self.queue_errors.is_empty() {
+            self.report
+                .push_str(&format!("\n{} demo(s) failed to analyse:\n", self.queue_errors.len()));
+            for (demo, err) in &self.queue_errors {
+                self.report.push_str(&format!("  {demo}: {err}\n"));
+            }
+        }
     }
 }
 
 // Maps SteamID64 -> username for a demo, preferring the lightweight player-index scrape
 // (available without a full inspection) and letting a full inspection override it.
+// The recorder-input checks (triggerbot / firewindow) are verdicts on their
+// own, so their detections are sorted above every other algorithm's in the UI.
+fn is_triggerbot_alert(detection: &Detection) -> bool {
+    detection.algorithm == TRIGGERBOT_NAME || detection.algorithm == FIREWINDOW_NAME
+}
+
 fn build_name_lookup(demo: &Demo) -> HashMap<u64, String> {
     let mut name_lookup: HashMap<u64, String> = HashMap::new();
     if let Some(players) = &demo.players {
@@ -583,11 +736,22 @@ impl FactoryComponent for DetectionRowModel {
         #[root]
         adw::ExpanderRow {
             set_title: &markup_escape_text(&format!("tick {}", self.detection.tick)),
-            set_subtitle: &markup_escape_text(&format!(
-                "{} - {}",
-                self.detection.algorithm,
-                detail::summary(&self.detection.data)
-            )),
+            set_subtitle: &markup_escape_text(&{
+                // Mass analysis tags each detection with its source demo.
+                let demo_tag = self
+                    .detection
+                    .data
+                    .get("demo")
+                    .and_then(|v| v.as_str())
+                    .map(|d| format!("[{d}] "))
+                    .unwrap_or_default();
+                format!(
+                    "{}{} - {}",
+                    demo_tag,
+                    self.detection.algorithm,
+                    detail::summary(&self.detection.data)
+                )
+            }),
             add_suffix = &gtk::Button {
                 set_label: "Go to tick",
                 set_has_frame: false,

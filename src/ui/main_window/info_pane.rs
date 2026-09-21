@@ -46,6 +46,7 @@ pub enum InfoPaneMsg {
     EditEvent(Event),
 
     DemoInspected(Demo),
+    QueueCheckDemos(Vec<Demo>),
 }
 
 pub struct InfoPaneModel {
@@ -161,6 +162,9 @@ impl Component for InfoPaneModel {
             }
             InfoPaneMsg::Rcon(act) => {
                 let _ = sender.output(InfoPaneOut::Rcon(act));
+            }
+            InfoPaneMsg::QueueCheckDemos(demos) => {
+                self.controls.emit(ControlsMsg::QueueCheckDemos(demos));
             }
             InfoPaneMsg::PlayheadTo(tick) => {
                 self.controls.emit(ControlsMsg::PlayheadMoved(tick as f64));
