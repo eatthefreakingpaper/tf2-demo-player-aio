@@ -1,0 +1,3 @@
+# Bash scripts must stay LF: MSYS2's bash rejects CRLF line endings, and git's
+# autocrlf would otherwise check them out as CRLF on Windows.
+*.sh text eol=lf
