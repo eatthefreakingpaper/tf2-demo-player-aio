@@ -36,7 +36,7 @@ impl AimSnap {
 
 impl<'a> CheatAlgorithm<'a> for AimSnap {
     fn default(&self) -> bool {
-        true
+        false
     }
 
     fn algorithm_name(&self) -> &str {
@@ -127,11 +127,14 @@ impl<'a> CheatAlgorithm<'a> for AimSnap {
                     == 1
                 && self.jg.fired(&steam_id, ticknum) < 5
             {
+                let (class_name, weapon_name) = state.get_player_class_and_weapon_by_sid(steam_id);
                 self.detections.push(Detection {
                     tick: ticknum - 2,
                     algorithm: self.algorithm_name().to_string(),
                     player: steam_id,
                     data: json!({
+                        "class": class_name,
+                        "weapon": weapon_name,
                         "deltas": deltas
                     }),
                 });

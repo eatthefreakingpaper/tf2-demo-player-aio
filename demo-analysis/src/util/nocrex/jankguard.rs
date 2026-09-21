@@ -24,18 +24,22 @@ pub struct JankGuard {
 
 impl JankGuard {
     pub fn teleported(&self, player: &u64, tick: u32) -> u32 {
-        tick - self
+        tick.saturating_sub(self
             .player_data
             .get(player)
-            .map_or(0, |pd| pd.last_teleport)
+            .map_or(0, |pd| pd.last_teleport))
     }
 
     pub fn spawned(&self, player: &u64, tick: u32) -> u32 {
-        tick - self.player_data.get(player).map_or(0, |pd| pd.last_spawn)
+        tick.saturating_sub(self.player_data.get(player).map_or(0, |pd| pd.last_spawn))
     }
 
     pub fn fired(&self, player: &u64, tick: u32) -> u32 {
-        tick - self.player_data.get(player).map_or(0, |pd| pd.last_fire)
+        tick.saturating_sub(self.player_data.get(player).map_or(0, |pd| pd.last_fire))
+    }
+
+    pub fn set_last_fire(&mut self, player: u64, tick: u32) {
+        self.player_data.entry(player).or_default().last_fire = tick;
     }
 
     pub fn handled_messages(&self) -> Result<Vec<tf_demo_parser::MessageType>, bool> {

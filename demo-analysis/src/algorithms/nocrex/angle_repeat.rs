@@ -27,9 +27,9 @@ impl AngleRepeat {
     pub fn new() -> Self {
         Self {
             params: HashMap::from([
-                ("min_angle_diff_ratio".to_string(), Parameter::Float(3.0)),
-                ("min_first_second_angle_delta".to_string(), Parameter::Float(0.0)),
-                ("max_first_third_angle_delta".to_string(), Parameter::Float(0.028)),
+                ("min_angle_diff_ratio".to_string(), Parameter::Float(0.0)),
+                ("min_first_second_angle_delta".to_string(), Parameter::Float(8.0)),
+                ("max_first_third_angle_delta".to_string(), Parameter::Float(1.5)),
             ]),
             ..Default::default()
         }
@@ -123,11 +123,14 @@ impl<'a> CheatAlgorithm<'a> for AngleRepeat {
                     && ratio > min_angle_diff_ratio
                     && self.jg.fired(&steam_id, ticknum) < 3
                 {
+                    let (class_name, weapon_name) = state.get_player_class_and_weapon_by_sid(steam_id);
                     self.detections.push(Detection {
                         tick: ticknum,
                         algorithm: self.algorithm_name().to_string(),
                         player: steam_id,
                         data: json!({
+                            "class": class_name,
+                            "weapon": weapon_name,
                             "angle_1": first_angle,
                             "angle_2": second_angle,
                             "angle_3": third_angle,

@@ -5,3 +5,6 @@ log.txt
 demos.cache
 settings.json
 libs/
+pack/
+.zcode/
+demo-analysis/Cargo.lock

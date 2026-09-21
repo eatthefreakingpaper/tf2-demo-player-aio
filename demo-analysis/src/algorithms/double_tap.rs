@@ -25,7 +25,7 @@ impl DoubleTap {
         Self {
             params: HashMap::from([
                 ("assert_pvs".to_string(), Parameter::Bool(true)),
-                ("min_tick_scout".to_string(), Parameter::Int(17)),
+                ("min_tick_scout".to_string(), Parameter::Int(3)),
                 ("min_tick_heavy".to_string(), Parameter::Int(3)),
             ]),
             shots: HashMap::new(),
@@ -40,11 +40,11 @@ fn is_cleaver_or_wrap_assassin(weapon_id: u32, damage: u32) -> bool {
 
 impl<'a> CheatAlgorithm<'a> for DoubleTap {
     fn default(&self) -> bool {
-        true
+        false
     }
 
     fn algorithm_name(&self) -> &str {
-        "doubletap"
+        "double_tap"
     }
 
     fn on_tick(
@@ -154,9 +154,11 @@ impl<'a> CheatAlgorithm<'a> for DoubleTap {
                 let diff = ticknum - past_tick;
 
                 if diff < min_diff && diff > 0 {
-                    let u200b = "​";
+                    let attacker_weapon = state.get_player_weapon(attacker);
+                    let u200b = "\u{200B}";
                     let data: Vec<(&str, Value)> = vec![
-                        ("class", Value::from(attacker.class.to_string())),
+                        ("class", Value::from(attacker.class_name())),
+                        ("weapon", Value::from(attacker_weapon)),
                         ("tick_1", Value::from(past_tick)),
                         ("tick_2", Value::from(ticknum)),
                         ("tick_diff", Value::from(diff)),

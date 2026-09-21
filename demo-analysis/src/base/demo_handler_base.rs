@@ -14,9 +14,16 @@ use tf_demo_parser::demo::data::{DemoTick, ServerTick};
 use tf_demo_parser::demo::header::Header;
 use std::borrow::Cow;
 
+pub trait DemoHandlerAnalyser: MessageHandler {
+    fn handle_user_cmd(&mut self, _packet: tf_demo_parser::demo::packet::usercmd::UserCmdPacket) {}
+    fn handle_console_cmd(&mut self, _packet: tf_demo_parser::demo::packet::consolecmd::ConsoleCmdPacket) {}
+}
+
+impl DemoHandlerAnalyser for NullHandler {}
+
 #[derive(Clone)]
 #[allow(dead_code)]
-pub struct CheatDemoHandler<'a, T: MessageHandler> {
+pub struct CheatDemoHandler<'a, T: DemoHandlerAnalyser> {
     pub server_tick: ServerTick,
     pub demo_tick: DemoTick,
     pub string_table_names: Vec<Cow<'a, str>>,
@@ -36,7 +43,7 @@ impl<'a> Default for CheatDemoHandler<'a, NullHandler> {
     }
 }
 
-impl<'a, T: MessageHandler> CheatDemoHandler<'a, T> {
+impl<'a, T: DemoHandlerAnalyser> CheatDemoHandler<'a, T> {
     pub fn with_analyser(analyser: T) -> Self {
         let state_handler = ParserState::new(24, T::does_handle, false);
 
@@ -96,6 +103,12 @@ impl<'a, T: MessageHandler> CheatDemoHandler<'a, T> {
                         message => self.handle_message(message, packet.tick),
                     }
                 }
+            }
+            Packet::UserCmd(packet) => {
+                self.analyser.handle_user_cmd(packet);
+            }
+            Packet::ConsoleCmd(packet) => {
+                self.analyser.handle_console_cmd(packet);
             }
             _ => {}
         };
@@ -162,7 +175,7 @@ impl<'a, T: MessageHandler> CheatDemoHandler<'a, T> {
     }
 }
 
-impl<T: MessageHandler + BorrowMessageHandler> CheatDemoHandler<'_, T> {
+impl<T: DemoHandlerAnalyser + BorrowMessageHandler> CheatDemoHandler<'_, T> {
     #[allow(dead_code)]
     pub fn borrow_output(&self) -> &T::Output {
         self.analyser.borrow_output(&self.state_handler)

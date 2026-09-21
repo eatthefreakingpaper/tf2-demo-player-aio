@@ -91,11 +91,18 @@ impl<'a> CheatAlgorithm<'a> for ViewAngles180Degrees {
             // Avoid creating multiple detection objects for the same player and tick.
             // Nothing will break if you do, but it will overrepresent the data point.
             if va_delta.abs() >= 180.0 || pa_delta.abs() >= 180.0 {
-                detections.push(Detection { 
+                let class_name = player.class_name();
+                let weapon_name = state.get_player_weapon(player);
+                detections.push(Detection {
                     tick: ticknum,
                     algorithm: self.algorithm_name().to_string(),
                     player: u64::from(SteamID::from_steam3(&steam_id).unwrap()),
-                    data: json!({ "va_delta": va_delta, "pa_delta": pa_delta })
+                    data: json!({
+                        "class": class_name,
+                        "weapon": weapon_name,
+                        "va_delta": va_delta,
+                        "pa_delta": pa_delta
+                    })
                 });
             }
         }

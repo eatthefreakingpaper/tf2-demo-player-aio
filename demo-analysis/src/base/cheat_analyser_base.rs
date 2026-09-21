@@ -56,7 +56,7 @@ impl PlayerState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Player {
-    entity: EntityId,
+    pub entity: EntityId,
     pub position: Vector,
     pub health: u16,
     pub max_health: u16,
@@ -70,7 +70,107 @@ pub struct Player {
     pub simtime: u16,
     pub ping: u16,
     pub in_pvs: bool,
+    pub active_weapon: Option<EntityId>,
+    pub cond: u32,
+    pub cond_ex: u32,
+    pub cond_ex2: u32,
+    pub invis_change_complete_time: f32,
+    pub flags: u32,
     // pub shot_fired: u32,
+}
+
+impl Player {
+    pub fn is_on_ground(&self) -> bool {
+        (self.flags & 1) != 0
+    }
+
+    pub fn is_ducking(&self) -> bool {
+        (self.flags & (1 << 1)) != 0
+    }
+
+    pub fn is_in_water(&self) -> bool {
+        // TF2 networks its water state as m_fFlags bit 10 (0x400): every
+        // player-tick below the waterline on water maps carries it, and it is
+        // never set anywhere else. The Source SDK's FL_INWATER (bit 9) and
+        // FL_SWIM (bit 11) do not appear in demos at all.
+        (self.flags & (1 << 10)) != 0
+    }
+
+    pub fn class_name(&self) -> &'static str {
+        match self.class {
+            Class::Scout => "scout",
+            Class::Sniper => "sniper",
+            Class::Soldier => "soldier",
+            Class::Demoman => "demoman",
+            Class::Medic => "medic",
+            Class::Heavy => "heavy",
+            Class::Pyro => "pyro",
+            Class::Spy => "spy",
+            Class::Engineer => "engineer",
+            Class::Other => "unknown",
+        }
+    }
+
+    pub fn is_cloaked(&self) -> bool {
+        (self.cond & (1 << 4)) != 0
+    }
+
+    pub fn is_burning(&self) -> bool {
+        (self.cond & (1 << 22)) != 0
+    }
+
+    pub fn is_jarated(&self) -> bool {
+        (self.cond & (1 << 24)) != 0
+    }
+
+    pub fn is_bleeding(&self) -> bool {
+        (self.cond & (1 << 25)) != 0
+    }
+
+    pub fn is_milked(&self) -> bool {
+        (self.cond & (1 << 27)) != 0
+    }
+
+    pub fn is_flickering(&self) -> bool {
+        (self.cond_ex & (1 << (61 - 32))) != 0
+    }
+
+    pub fn is_gas_coated(&self) -> bool {
+        (self.cond_ex2 & (1 << (73 - 64))) != 0
+    }
+
+    pub fn is_stealthed_blink(&self) -> bool {
+        (self.cond_ex2 & (1 << (70 - 64))) != 0
+    }
+
+    pub fn is_taunting(&self) -> bool {
+        (self.cond & (1 << 14)) != 0
+    }
+
+    pub fn is_stunned(&self) -> bool {
+        (self.cond & (1 << 15)) != 0
+    }
+
+    pub fn is_marked_for_death(&self) -> bool {
+        (self.cond & (1 << 30)) != 0
+    }
+
+    pub fn has_visible_effect(&self) -> bool {
+        self.is_burning()
+            || self.is_jarated()
+            || self.is_bleeding()
+            || self.is_milked()
+            || self.is_flickering()
+            || self.is_gas_coated()
+            || self.is_stealthed_blink()
+            || self.is_taunting()
+            || self.is_stunned()
+            || self.is_marked_for_death()
+    }
+
+    pub fn is_completely_invisible(&self) -> bool {
+        self.is_cloaked() && !self.has_visible_effect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -267,18 +367,78 @@ pub struct World {
 //     }
 // }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct WeaponEntity {
+    pub entity: EntityId,
+    pub class_name: String,
+    pub item_def_index: Option<u16>,
+}
+
+impl WeaponEntity {
+    pub fn name(&self, player_class: Class) -> String {
+        crate::util::helpers::weapon_name_from_id_or_class(self.item_def_index, &self.class_name, player_class)
+    }
+}
+
 #[derive(Default, Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct CheatAnalyserState {
     pub players: Vec<Player>,
+    pub player_names: HashMap<u64, String>,
+    pub user_info_history: HashMap<u64, UserInfo>,
     pub entid_to_userid: HashMap<EntityId, UserId>,
     pub userid_to_id64: HashMap<UserId, u64>,
     pub buildings: BTreeMap<EntityId, Building>,
+    pub weapons: HashMap<EntityId, WeaponEntity>,
     pub world: Option<World>,
+    pub friends_ids: HashMap<EntityId, u32>,
+    pub custom_files: HashMap<EntityId, [u32; 4]>,
     // pub kills: Vec<Kill>,
     pub tick: DemoTick,
+    pub header: Option<Header>,
+    pub user_cmds: Vec<tf_demo_parser::demo::packet::usercmd::UserCmdPacket>,
+    // The recorder's literal console commands (container-level ConsoleCmd
+    // frames), e.g. "+attack 45". Tick-tagged in file order.
+    pub console_cmds: Vec<(DemoTick, String)>,
 }
 
 impl CheatAnalyserState {
+    pub fn get_player_name(&self, sid: u64) -> Option<&str> {
+        if let Some(name) = self.player_names.get(&sid) {
+            return Some(name.as_str());
+        }
+        for player in &self.players {
+            if let Some(info) = &player.info {
+                if let Ok(steam_id) = SteamID::from_steam3(&info.steam_id) {
+                    if u64::from(steam_id) == sid {
+                        return Some(info.name.as_str());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_player_weapon(&self, player: &Player) -> String {
+        if let Some(weapon_ent) = player.active_weapon {
+            if let Some(weapon) = self.weapons.get(&weapon_ent) {
+                return weapon.name(player.class);
+            }
+        }
+        "unknown".to_string()
+    }
+
+    pub fn get_player_class_and_weapon_by_sid(&self, sid: u64) -> (&'static str, String) {
+        if let Some(player) = self.players.iter().find(|p| {
+            p.info.as_ref().is_some_and(|info| {
+                SteamID::from_steam3(&info.steam_id).map(u64::from).ok() == Some(sid)
+            })
+        }) {
+            (player.class_name(), self.get_player_weapon(player))
+        } else {
+            ("unknown", "unknown".to_string())
+        }
+    }
+
     pub fn get_or_create_player(&mut self, entity_id: EntityId) -> &mut Player {
         let index = match self
             .players
@@ -347,6 +507,7 @@ pub struct CheatAnalyser<'a> {
     pub detections: Vec<Detection>,
     pub header: Option<Header>,
     pub tick: DemoTick,
+    pub worker_id: usize,
     last_progress_update_time: Instant,
     progress: Vec<u32>,
     class_names: Vec<ServerClassName>, // indexed by ClassId
@@ -360,6 +521,7 @@ impl<'a> Default for CheatAnalyser<'a> {
             detections: Default::default(),
             header: Default::default(),
             tick: Default::default(),
+            worker_id: 0,
             last_progress_update_time: Instant::now(),
             progress: Default::default(),
             class_names: Default::default(),
@@ -377,6 +539,10 @@ impl MessageHandler for CheatAnalyser<'_> {
 
     fn handle_header(&mut self, _header: &tf_demo_parser::demo::header::Header) {
         self.header = Some(_header.clone());
+        self.state.header = Some(_header.clone());
+        if _header.ticks > 0 {
+            crate::PROGRESS_TOTAL.store(_header.ticks, std::sync::atomic::Ordering::Relaxed);
+        }
         self.print_metadata();
     }
 
@@ -395,6 +561,7 @@ impl MessageHandler for CheatAnalyser<'_> {
                         Err(_) => {}
                     }
                 }
+                self.state.user_cmds.clear();
             }
             Message::TempEntities(_) => {
                 // println!("{}: {:#?}", _tick, message);
@@ -502,6 +669,16 @@ impl BorrowMessageHandler for CheatAnalyser<'_> {
     }
 }
 
+impl crate::base::demo_handler_base::DemoHandlerAnalyser for CheatAnalyser<'_> {
+    fn handle_user_cmd(&mut self, packet: tf_demo_parser::demo::packet::usercmd::UserCmdPacket) {
+        self.state.user_cmds.push(packet);
+    }
+
+    fn handle_console_cmd(&mut self, packet: tf_demo_parser::demo::packet::consolecmd::ConsoleCmdPacket) {
+        self.state.console_cmds.push((packet.tick, packet.command));
+    }
+}
+
 impl<'a> CheatAnalyser<'a> {
     pub fn new(algorithms: Vec<Box<dyn CheatAlgorithm<'a> + 'a + Send>>) -> Self {
         let mut message_types = HANDLED_MESSAGE_TYPES.lock().unwrap();
@@ -531,10 +708,15 @@ impl<'a> CheatAnalyser<'a> {
             detections: Vec::new(),
             header: None,
             tick: DemoTick::default(),
+            worker_id: 0,
             last_progress_update_time: Instant::now(),
             progress: vec![],
             class_names: Vec::new(),
         }
+    }
+
+    pub fn handle_user_cmd(&mut self, packet: tf_demo_parser::demo::packet::usercmd::UserCmdPacket) {
+        self.state.user_cmds.push(packet);
     }
 
     pub fn init(&mut self) -> Result<(), Error> {
@@ -554,6 +736,12 @@ impl<'a> CheatAnalyser<'a> {
                 Err(_) => continue,
             }
         }
+        self.detections.sort_by(|a, b| {
+            a.tick
+                .cmp(&b.tick)
+                .then_with(|| a.player.cmp(&b.player))
+                .then_with(|| a.algorithm.cmp(&b.algorithm))
+        });
         Ok(())
     }
 
@@ -634,12 +822,20 @@ impl<'a> CheatAnalyser<'a> {
     fn check_progress(&mut self) {
         const PROGRESS_UPDATE_INTERVAL_MS: u128 = 1000;
         const TPS_ROLLING_AVERAGE_WINDOW: u32 = 10;
-        crate::PROGRESS_CURRENT.store(self.tick.into(), std::sync::atomic::Ordering::Relaxed);
-        crate::PROGRESS_TOTAL.store(self.get_tick_count_u32(), std::sync::atomic::Ordering::Relaxed);
+        let tick: u32 = self.tick.into();
+        let total_ticks = self.get_header_tick_count_u32();
+
+        if self.worker_id < crate::MAX_WORKERS {
+            crate::WORKER_TICKS[self.worker_id].store(tick, std::sync::atomic::Ordering::Relaxed);
+        }
+        if total_ticks > 0 {
+            crate::PROGRESS_TOTAL.store(total_ticks, std::sync::atomic::Ordering::Relaxed);
+        }
+        crate::PROGRESS_CURRENT.store(tick, std::sync::atomic::Ordering::Relaxed);
+
         if self.last_progress_update_time.elapsed().as_millis() < PROGRESS_UPDATE_INTERVAL_MS {
             return;
         }
-        let tick: u32 = self.tick.into();
 
         self.last_progress_update_time = Instant::now();
         self.progress.push(tick);
@@ -655,12 +851,18 @@ impl<'a> CheatAnalyser<'a> {
             tick.into()
         };
 
-        dev_print!(
-            "Processing tick {} ({} remaining, {:.0} tps)",
-            tick,
-            self.get_tick_count_u32() - tick,
-            tps
-        );
+        if self.worker_id == 0 {
+            dev_print!(
+                "Processing tick {} ({} remaining, {:.0} tps)",
+                tick,
+                if total_ticks > tick { total_ticks - tick } else { 0 },
+                tps
+            );
+        }
+    }
+
+    pub fn get_header_tick_count_u32(&self) -> u32 {
+        self.header.as_ref().map(|h| h.ticks).unwrap_or(0)
     }
 
     pub fn get_tick_count_u32(&self) -> u32 {
@@ -681,6 +883,59 @@ impl<'a> CheatAnalyser<'a> {
             .get(usize::from(entity.server_class))
             .map(|class_name| class_name.as_str())
             .unwrap_or("");
+
+        if entity.update_type == UpdateType::Delete {
+            self.state.weapons.remove(&entity.entity_index);
+        } else {
+            let mut item_def = None;
+            for prop in entity.props(parser_state) {
+                if let Some((_, prop_name)) = prop.identifier.names() {
+                    if prop_name == "m_iItemDefinitionIndex" {
+                        if let Ok(val) = i64::try_from(&prop.value) {
+                            item_def = Some(val as u16);
+                        }
+                    }
+                }
+            }
+            if item_def.is_some()
+                || class_name.starts_with("CTFWeapon")
+                || class_name.starts_with("CTFShotgun")
+                || class_name.starts_with("CTFRocketLauncher")
+                || class_name.starts_with("CTFPipebombLauncher")
+                || class_name.starts_with("CTFGrenadeLauncher")
+                || class_name.starts_with("CTFCompoundBow")
+                || class_name.starts_with("CTFMinigun")
+                || class_name.starts_with("CTFScatterGun")
+                || class_name.starts_with("CTFKnife")
+                || class_name.starts_with("CTFRevolver")
+                || class_name.starts_with("CTFMedigun")
+                || class_name.starts_with("CTFBonesaw")
+                || class_name.starts_with("CTFClub")
+                || class_name.starts_with("CTFSword")
+                || class_name.starts_with("CTFWrench")
+                || class_name.starts_with("CTFFlameThrower")
+                || class_name.starts_with("CTFPistol")
+                || class_name.starts_with("CTFJar")
+                || class_name.starts_with("CTFBuffItem")
+                || class_name.starts_with("CTFLunchBox")
+                || class_name.starts_with("CTFCrossbow")
+                || class_name.starts_with("CTFStickBomb")
+                || class_name.starts_with("CTFParticleCannon")
+                || class_name.starts_with("CTFRaygun")
+                || class_name.starts_with("CTFDRG_Pomson")
+                || class_name.starts_with("CTFSniperRifle")
+                || class_name.starts_with("CWeapon")
+                || (class_name.starts_with("CTF") && class_name.contains("Weapon"))
+            {
+                let entry = self.state.weapons.entry(entity.entity_index).or_default();
+                entry.entity = entity.entity_index;
+                entry.class_name = class_name.to_string();
+                if item_def.is_some() {
+                    entry.item_def_index = item_def;
+                }
+            }
+        }
+
         match class_name {
             "CTFPlayer" => self.handle_player_entity(entity, parser_state),
             "CTFPlayerResource" => self.handle_player_resource(entity, parser_state),
@@ -773,6 +1028,48 @@ impl<'a> CheatAnalyser<'a> {
         player.in_pvs = entity.in_pvs;
 
         for prop in entity.props(parser_state) {
+            if let Some((_, prop_name)) = prop.identifier.names() {
+                match prop_name.as_str() {
+                    "m_hActiveWeapon" => {
+                        if let Ok(val) = i64::try_from(&prop.value) {
+                            let handle = val as u32;
+                            let ent_id = crate::util::helpers::handle_to_entid(handle);
+                            player.active_weapon = if u32::from(ent_id) != 0x7FF && u32::from(ent_id) != 0 {
+                                Some(ent_id)
+                            } else {
+                                None
+                            };
+                        }
+                    }
+                    "m_nPlayerCond" | "_condition_bits" => {
+                        if let Ok(val) = i64::try_from(&prop.value) {
+                            player.cond = val as u32;
+                        }
+                    }
+                    "m_nPlayerCondEx" => {
+                        if let Ok(val) = i64::try_from(&prop.value) {
+                            player.cond_ex = val as u32;
+                        }
+                    }
+                    "m_nPlayerCondEx2" => {
+                        if let Ok(val) = i64::try_from(&prop.value) {
+                            player.cond_ex2 = val as u32;
+                        }
+                    }
+                    "m_flInvisChangeCompleteTime" => {
+                        if let Ok(val) = f32::try_from(&prop.value) {
+                            player.invis_change_complete_time = val;
+                        }
+                    }
+                    "m_fFlags" => {
+                        if let Ok(val) = i64::try_from(&prop.value) {
+                            player.flags = val as u32;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             match prop.identifier {
                 HEALTH_PROP => {
                     player.health = i64::try_from(&prop.value).unwrap_or_default() as u16
@@ -1064,12 +1361,25 @@ impl<'a> CheatAnalyser<'a> {
         {
             let ent_id = user_info.entity_id;
             self.state
+                .friends_ids
+                .insert(ent_id, user_info.player_info.friends_id);
+            self.state
+                .custom_files
+                .insert(ent_id, user_info.player_info.custom_file);
+            self.state
                 .set_entid_to_userid(ent_id, user_info.player_info.user_id.clone());
-            match SteamID::from_steam3(&user_info.player_info.steam_id) {
-                Ok(steam_id) => self
-                    .state
-                    .set_userid_to_id64(user_info.player_info.user_id.clone(), steam_id.into()),
-                Err(_) => {}
+            if let Ok(steam_id) = SteamID::from_steam3(&user_info.player_info.steam_id) {
+                let id64: u64 = steam_id.into();
+                self.state
+                    .set_userid_to_id64(user_info.player_info.user_id.clone(), id64);
+                if !user_info.player_info.name.is_empty() {
+                    self.state
+                        .player_names
+                        .insert(id64, user_info.player_info.name.clone());
+                }
+                self.state
+                    .user_info_history
+                    .insert(id64, user_info.clone().into());
             }
             self.state.get_or_create_player(ent_id).info = Some(user_info.into());
         }

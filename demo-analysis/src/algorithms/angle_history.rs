@@ -135,12 +135,15 @@ impl<'a> CheatAlgorithm<'a> for AngleHistory {
 
                         if mid_delta > min_delta_second_third 
                             && self.jg.fired(&steam_id, ticknum) <= (i as u32 + 5) {
-
+                            let class_name = player.class_name();
+                            let weapon_name = state.get_player_weapon(player);
                             self.detections.push(Detection {
                                 tick: ticknum,
                                 algorithm: self.algorithm_name().to_string(),
                                 player: steam_id,
                                 data: json!({
+                                    "class": class_name,
+                                    "weapon": weapon_name,
                                     "angle_current": current_angle,
                                     "angle_middle": (mid_player.view_angle, mid_player.pitch_angle),
                                     "angle_trigger": (player.view_angle, player.pitch_angle),

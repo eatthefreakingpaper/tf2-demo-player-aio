@@ -42,7 +42,7 @@ fn is_backstab(damage: u16, is_crit: bool, weapon_id: u16, victim_health: u16) -
 
 impl<'a> CheatAlgorithm<'a> for BackTrack {
     fn default(&self) -> bool {
-        true
+        false
     }
 
     fn algorithm_name(&self) -> &str {
@@ -152,8 +152,11 @@ impl<'a> CheatAlgorithm<'a> for BackTrack {
 
                         // ########################
 
-                        let u200b = "​";
+                        let attacker_weapon = state.get_player_weapon(attacker);
+                        let u200b = "\u{200B}";
                         let data: Vec<(&str, Value)> = vec![
+                            ("class", Value::from(attacker.class_name())),
+                            ("weapon", Value::from(attacker_weapon)),
                             ("angle_attacker", Value::from(attacker.view_angle)),
                             ("angle_victim", Value::from(victim.view_angle)),
                             ("angle_diff", Value::from(angle_diff)),
