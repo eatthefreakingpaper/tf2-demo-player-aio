@@ -9,6 +9,7 @@ pub use crate::algorithms::{
     double_tap::DoubleTap,
     triggerbot::TriggerBot,
     firewindow::FireWindow,
+    recorder_aim_assist::RecorderAimAssist,
     nocrex:: {
         aimsnap::AimSnap,
         angle_repeat::AngleRepeat,
@@ -50,6 +51,7 @@ pub fn get_algorithms() -> Vec<Box<dyn CheatAlgorithm<'static> + Send>> {
         Box::new(DoubleTap::new()),
         Box::new(TriggerBot::new()),
         Box::new(FireWindow::new()),
+        Box::new(RecorderAimAssist::new()),
         Box::new(SilentAim::new()),
         Box::new(Psilent4::new()),
         Box::new(NoSpread::new()),

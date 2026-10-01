@@ -14,6 +14,7 @@ pub mod algorithms {
     pub mod double_tap;
     pub mod triggerbot;
     pub mod firewindow;
+    pub mod recorder_aim_assist;
     pub mod nocrex {
         pub mod aimsnap;
         pub mod angle_repeat;
@@ -31,6 +32,7 @@ pub mod algorithms {
 
 pub mod util {
     pub mod helpers;
+    pub mod recorder_cmd;
     pub mod schema_equip_regions;
     pub mod nocrex {
         pub mod jankguard;
