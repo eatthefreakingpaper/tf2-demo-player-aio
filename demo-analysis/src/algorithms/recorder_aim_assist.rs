@@ -61,6 +61,8 @@ struct SimulationEvidence {
     mouse_dx: i16,
     mouse_dy: i16,
     eligible_step: bool,
+    mismatch_steps: u32,
+    movement_deg: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +161,19 @@ impl RecorderAimAssist {
                 (
                     "min_input_mismatch_event_fraction".to_string(),
                     Parameter::Float(0.25),
+                ),
+                ("burst_window_ticks".to_string(), Parameter::Int(64)),
+                ("min_burst_mismatch_steps".to_string(), Parameter::Int(16)),
+                ("min_burst_events".to_string(), Parameter::Int(2)),
+                ("tracking_window_ticks".to_string(), Parameter::Int(128)),
+                ("min_tracking_events".to_string(), Parameter::Int(5)),
+                (
+                    "max_micro_correction_deg".to_string(),
+                    Parameter::Float(0.20),
+                ),
+                (
+                    "min_micro_correction_event_fraction".to_string(),
+                    Parameter::Float(0.75),
                 ),
             ]),
         }
@@ -620,6 +635,21 @@ impl<'a> CheatAlgorithm<'a> for RecorderAimAssist {
         let min_mismatch_fraction =
             get_parameter_value::<f32>(&self.params, "min_input_mismatch_event_fraction")
                 .clamp(0.0, 1.0);
+        let burst_window_ticks =
+            get_parameter_value::<i32>(&self.params, "burst_window_ticks").max(0) as u32;
+        let min_burst_mismatch_steps =
+            get_parameter_value::<i32>(&self.params, "min_burst_mismatch_steps").max(0) as u32;
+        let min_burst_events =
+            get_parameter_value::<i32>(&self.params, "min_burst_events").max(0) as usize;
+        let tracking_window_ticks =
+            get_parameter_value::<i32>(&self.params, "tracking_window_ticks").max(0) as u32;
+        let min_tracking_events =
+            get_parameter_value::<i32>(&self.params, "min_tracking_events").max(0) as usize;
+        let max_micro_correction =
+            get_parameter_value::<f32>(&self.params, "max_micro_correction_deg").max(0.0);
+        let min_micro_correction_fraction =
+            get_parameter_value::<f32>(&self.params, "min_micro_correction_event_fraction")
+                .clamp(0.0, 1.0);
         let candidate_rate = if self.eligible_commands == 0 {
             0.0
         } else {
@@ -643,6 +673,8 @@ impl<'a> CheatAlgorithm<'a> for RecorderAimAssist {
                         yaw_per_count,
                         pitch_per_count,
                         require_zero_mouse_counts,
+                        min_simulated_offset,
+                        min_simulated_offset_ratio,
                     ),
                 )
             })
@@ -666,11 +698,40 @@ impl<'a> CheatAlgorithm<'a> for RecorderAimAssist {
             mismatch_events.len() as f32 / self.events.len() as f32
         };
 
+        // A few legitimate mouse-independent view updates can happen to converge on a
+        // target. Require the recording-wide mismatches to form a recognizable assist
+        // pattern instead of accepting unrelated coincidences spread across the demo.
+        let micro_correction_events = mismatch_events
+            .iter()
+            .filter(|(_, evidence)| evidence.movement_deg <= max_micro_correction)
+            .count();
+        let micro_correction_fraction =
+            evidence_fraction(micro_correction_events, mismatch_events.len());
+        let (_, max_burst_mismatch_steps, max_burst_events) =
+            max_target_window_evidence(&mismatch_events, burst_window_ticks);
+        let (max_tracking_events, _, _) =
+            max_target_window_evidence(&mismatch_events, tracking_window_ticks);
+
         let calibration_mode = min_simulated_offset == 0.0
             && min_simulated_offset_ratio == 0.0
             && min_input_mismatch_events == 0
             && min_mismatch_rate == 0.0
             && min_mismatch_fraction == 0.0;
+        let assistance_profile = if calibration_mode {
+            Some("calibration")
+        } else {
+            assistance_profile(
+                micro_correction_events,
+                mismatch_events.len(),
+                min_micro_correction_fraction,
+                max_burst_mismatch_steps,
+                min_burst_mismatch_steps,
+                max_burst_events,
+                min_burst_events,
+                max_tracking_events,
+                min_tracking_events,
+            )
+        };
         if !aggregate_evidence_passes(
             self.eligible_commands,
             candidate_rate,
@@ -683,9 +744,19 @@ impl<'a> CheatAlgorithm<'a> for RecorderAimAssist {
             min_mismatch_rate,
             min_mismatch_fraction,
             calibration_mode,
-        ) {
+        ) || assistance_profile.is_none()
+        {
             return Ok(vec![]);
         }
+        let assistance_profile = assistance_profile.expect("profile checked above");
+        let profile_summary = json!({
+            "name": assistance_profile,
+            "micro_correction_event_count": micro_correction_events,
+            "micro_correction_event_fraction": micro_correction_fraction,
+            "max_burst_mismatch_steps": max_burst_mismatch_steps,
+            "max_burst_events": max_burst_events,
+            "max_tracking_events": max_tracking_events,
+        });
 
         let Some(recorder_sid) = self.recorder_sid else {
             return Ok(vec![]);
@@ -738,6 +809,7 @@ impl<'a> CheatAlgorithm<'a> for RecorderAimAssist {
                         "simulated_mouse_dx": simulation.mouse_dx,
                         "simulated_mouse_dy": simulation.mouse_dy,
                         "simulated_has_eligible_step": simulation.eligible_step,
+                        "simulated_mismatch_steps": simulation.mismatch_steps,
                         "recording_yaw_degrees_per_mouse_count": yaw_per_count,
                         "recording_pitch_degrees_per_mouse_count": pitch_per_count,
                         "recording_candidate_commands": self.candidate_commands,
@@ -747,6 +819,7 @@ impl<'a> CheatAlgorithm<'a> for RecorderAimAssist {
                         "recording_mismatch_event_count": mismatch_event_count,
                         "recording_mismatch_event_rate": mismatch_event_rate,
                         "recording_mismatch_event_fraction": mismatch_event_fraction,
+                        "recording_assistance_profile": profile_summary.clone(),
                         "recording_requires_zero_mouse_counts": require_zero_mouse_counts,
                         "input_evidence": "target correction diverges from UserCmd mouse simulation",
                         "confidence": confidence,
@@ -756,6 +829,73 @@ impl<'a> CheatAlgorithm<'a> for RecorderAimAssist {
             .collect())
     }
 }
+fn evidence_fraction(count: usize, total: usize) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        count as f32 / total as f32
+    }
+}
+
+fn max_target_window_evidence(
+    events: &[(&AimEvent, SimulationEvidence)],
+    window_ticks: u32,
+) -> (usize, u32, usize) {
+    let mut max_events = 0;
+    let mut max_mismatch_steps = 0;
+    let mut events_at_max_mismatch_steps = 0;
+
+    for (start, _) in events {
+        let window_end = start.best_tick.saturating_add(window_ticks);
+        let mut event_count = 0;
+        let mut mismatch_steps = 0;
+        for (event, evidence) in events {
+            let same_target = event.target_entity == start.target_entity
+                && event.target_sid == start.target_sid
+                && event.target_user_id == start.target_user_id;
+            if same_target && event.best_tick >= start.best_tick && event.best_tick <= window_end {
+                event_count += 1;
+                mismatch_steps += evidence.mismatch_steps;
+            }
+        }
+        max_events = max_events.max(event_count);
+        if mismatch_steps > max_mismatch_steps
+            || (mismatch_steps == max_mismatch_steps && event_count > events_at_max_mismatch_steps)
+        {
+            max_mismatch_steps = mismatch_steps;
+            events_at_max_mismatch_steps = event_count;
+        }
+    }
+
+    (max_events, max_mismatch_steps, events_at_max_mismatch_steps)
+}
+
+fn assistance_profile(
+    micro_correction_events: usize,
+    mismatch_events: usize,
+    min_micro_correction_fraction: f32,
+    max_burst_mismatch_steps: u32,
+    min_burst_mismatch_steps: u32,
+    max_burst_events: usize,
+    min_burst_events: usize,
+    max_tracking_events: usize,
+    min_tracking_events: usize,
+) -> Option<&'static str> {
+    let micro_correction_fraction = evidence_fraction(micro_correction_events, mismatch_events);
+
+    if micro_correction_fraction >= min_micro_correction_fraction {
+        Some("micro_corrections")
+    } else if max_burst_mismatch_steps >= min_burst_mismatch_steps
+        && max_burst_events >= min_burst_events
+    {
+        Some("burst_corrections")
+    } else if max_tracking_events >= min_tracking_events {
+        Some("rapid_target_tracking")
+    } else {
+        None
+    }
+}
+
 fn aggregate_evidence_passes(
     eligible_commands: u32,
     candidate_rate: f32,
@@ -836,13 +976,16 @@ fn simulate_event(
     yaw_per_count: Option<f32>,
     pitch_per_count: Option<f32>,
     require_zero_mouse_counts: bool,
+    min_offset_deg: f32,
+    min_offset_ratio: f32,
 ) -> SimulationEvidence {
     let per_command_quantization = yaw_per_count
         .map(f32::abs)
         .unwrap_or(0.0)
         .hypot(pitch_per_count.map(f32::abs).unwrap_or(0.0));
 
-    event
+    let mut mismatch_steps = 0;
+    let best = event
         .input_steps
         .iter()
         .filter(|step| !require_zero_mouse_counts || (step.mouse_dx == 0 && step.mouse_dy == 0))
@@ -854,15 +997,21 @@ fn simulate_event(
                 .map(|scale| unexplained_axis_delta(step.delta_pitch, step.mouse_dy, scale))
                 .unwrap_or(0.0);
             let offset_deg = yaw_offset_deg.hypot(pitch_offset_deg);
+            let offset_ratio = offset_deg / per_command_quantization.max(0.01);
+            if offset_deg >= min_offset_deg && offset_ratio >= min_offset_ratio {
+                mismatch_steps += 1;
+            }
 
             SimulationEvidence {
                 yaw_offset_deg,
                 pitch_offset_deg,
                 offset_deg,
-                offset_ratio: offset_deg / per_command_quantization.max(0.01),
+                offset_ratio,
                 mouse_dx: step.mouse_dx,
                 mouse_dy: step.mouse_dy,
                 eligible_step: true,
+                mismatch_steps: 0,
+                movement_deg: step.delta_yaw.hypot(step.delta_pitch),
             }
         })
         .max_by(|a, b| a.offset_ratio.total_cmp(&b.offset_ratio))
@@ -874,7 +1023,14 @@ fn simulate_event(
             mouse_dx: 0,
             mouse_dy: 0,
             eligible_step: false,
-        })
+            mismatch_steps: 0,
+            movement_deg: 0.0,
+        });
+
+    SimulationEvidence {
+        mismatch_steps,
+        ..best
+    }
 }
 fn better_solution(candidate: AimSolution, current: AimSolution) -> bool {
     candidate.after_error_radii < current.after_error_radii
@@ -1075,6 +1231,46 @@ mod tests {
         }
     }
 
+    fn evidence_with_mismatch_steps(mismatch_steps: u32) -> SimulationEvidence {
+        SimulationEvidence {
+            yaw_offset_deg: 1.0,
+            pitch_offset_deg: 0.0,
+            offset_deg: 1.0,
+            offset_ratio: 10.0,
+            mouse_dx: 0,
+            mouse_dy: 0,
+            eligible_step: true,
+            mismatch_steps,
+            movement_deg: 1.0,
+        }
+    }
+
+    #[test]
+    fn target_window_evidence_respects_target_and_time() {
+        let mut first = event_with_steps(vec![]);
+        first.best_tick = 100;
+        let mut second = first.clone();
+        second.best_tick = 150;
+        let mut third = first.clone();
+        third.best_tick = 220;
+        let mut other = first.clone();
+        other.target_entity = 3;
+        other.best_tick = 110;
+        let mut other_later = other.clone();
+        other_later.best_tick = 180;
+
+        let events = vec![
+            (&first, evidence_with_mismatch_steps(3)),
+            (&second, evidence_with_mismatch_steps(4)),
+            (&third, evidence_with_mismatch_steps(2)),
+            (&other, evidence_with_mismatch_steps(20)),
+            (&other_later, evidence_with_mismatch_steps(1)),
+        ];
+
+        assert_eq!(max_target_window_evidence(&events, 64), (2, 20, 1));
+        assert_eq!(max_target_window_evidence(&events, 80), (2, 21, 2));
+    }
+
     #[test]
     fn axis_scale_fit_needs_support_and_rejects_outliers() {
         let mut samples: Vec<AxisSample> = (1..=23)
@@ -1124,10 +1320,10 @@ mod tests {
             mouse_dx: 0,
             mouse_dy: 100,
         }]);
-        let yaw_only = simulate_event(&event, Some(0.02), None, false);
+        let yaw_only = simulate_event(&event, Some(0.02), None, false, 0.05, 2.5);
         assert!((yaw_only.yaw_offset_deg - 4.98).abs() < 1e-5);
         assert_eq!(yaw_only.pitch_offset_deg, 0.0);
-        let pitch_only = simulate_event(&event, None, Some(0.02), false);
+        let pitch_only = simulate_event(&event, None, Some(0.02), false, 0.05, 2.5);
         assert_eq!(pitch_only.yaw_offset_deg, 0.0);
         assert_eq!(pitch_only.pitch_offset_deg, 0.0);
         assert_eq!(pitch_only.offset_deg, 0.0);
@@ -1157,11 +1353,38 @@ mod tests {
                 .sum::<f32>(),
             0.0
         );
-        let evidence = simulate_event(&event, Some(0.02), None, true);
+        let evidence = simulate_event(&event, Some(0.02), None, true, 0.05, 2.5);
         assert!((evidence.offset_deg - 0.98).abs() < 1e-5);
         assert!((evidence.yaw_offset_deg.abs() - 0.98).abs() < 1e-5);
         assert!(evidence.offset_ratio > 40.0);
     }
+    #[test]
+    fn assistance_profiles_reject_diffuse_legitimate_mismatches() {
+        let profile = |micro, total, burst_steps, burst_events, tracking_events| {
+            assistance_profile(
+                micro,
+                total,
+                0.75,
+                burst_steps,
+                16,
+                burst_events,
+                2,
+                tracking_events,
+                5,
+            )
+        };
+
+        // The strongest negative windows reach 12 unexplained steps in 64 ticks
+        // and four same-target events in 128 ticks, both below the assist profiles.
+        assert_eq!(profile(0, 19, 12, 2, 4), None);
+        assert_eq!(profile(0, 207, 12, 1, 4), None);
+
+        assert_eq!(profile(22, 24, 19, 2, 3), Some("micro_corrections"));
+        assert_eq!(profile(3, 35, 24, 2, 3), Some("burst_corrections"));
+        assert_eq!(profile(3, 18, 9, 3, 6), Some("rapid_target_tracking"));
+        assert_eq!(profile(0, 0, 0, 0, 0), None);
+    }
+
     #[test]
     fn aggregate_gate_separates_current_clean_and_assisted_corpora() {
         let passes = |eligible, candidate_rate, unexplained, unexplained_rate, fraction| {
