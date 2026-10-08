@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use anyhow::Error;
 use serde_json::json;
-use steamid_ng::SteamID;
 use tf_demo_parser::demo::vector::Vector;
 use tf_demo_parser::ParserState;
 
@@ -105,8 +104,7 @@ impl<'a> CheatAlgorithm<'a> for BunnyHop {
 
         let min_streak: i32 = get_parameter_value(&self.params, "min_streak");
         let min_air_ticks: i32 = get_parameter_value(&self.params, "min_air_ticks");
-        let max_ground_ticks: i32 =
-            get_parameter_value(&self.params, "max_ground_ticks_bhop");
+        let max_ground_ticks: i32 = get_parameter_value(&self.params, "max_ground_ticks_bhop");
         let min_speed: f32 = get_parameter_value(&self.params, "min_speed");
 
         let mut tick_detections = Vec::new();
@@ -117,16 +115,9 @@ impl<'a> CheatAlgorithm<'a> for BunnyHop {
                 && p.state == PlayerState::Alive
                 && p.info.as_ref().is_some_and(|info| info.steam_id != "BOT")
         }) {
-            let info = match &player.info {
-                Some(info) => info,
-                None => continue,
+            let Some(steam_id) = player.steam_id() else {
+                continue;
             };
-
-            let steam_id: u64 = match SteamID::from_steam3(&info.steam_id) {
-                Ok(sid) => u64::from(sid),
-                Err(_) => continue,
-            };
-
             let ticks_since_event = self
                 .jg
                 .teleported(&steam_id, ticknum)
@@ -150,7 +141,9 @@ impl<'a> CheatAlgorithm<'a> for BunnyHop {
             if self
                 .last_water_tick
                 .get(&steam_id)
-                .is_some_and(|&water_tick| ticknum.saturating_sub(water_tick) <= WATER_EXIT_GRACE_TICKS)
+                .is_some_and(|&water_tick| {
+                    ticknum.saturating_sub(water_tick) <= WATER_EXIT_GRACE_TICKS
+                })
             {
                 self.player_states.remove(&steam_id);
                 continue;
@@ -163,7 +156,10 @@ impl<'a> CheatAlgorithm<'a> for BunnyHop {
             let dz = player.position.z - prev_z;
 
             let (dx, dy) = if let Some(prev_pos) = pstate.prev_pos {
-                (player.position.x - prev_pos.x, player.position.y - prev_pos.y)
+                (
+                    player.position.x - prev_pos.x,
+                    player.position.y - prev_pos.y,
+                )
             } else {
                 (0.0, 0.0)
             };
@@ -242,16 +238,16 @@ impl<'a> CheatAlgorithm<'a> for BunnyHop {
 
                         if pstate.current_streak >= min_streak as u32
                             && pstate.current_streak > pstate.last_reported_streak
-                            && pstate.hop_ground_ticks.iter().all(|&g| g <= max_ground_ticks as u32)
+                            && pstate
+                                .hop_ground_ticks
+                                .iter()
+                                .all(|&g| g <= max_ground_ticks as u32)
                         {
                             pstate.last_reported_streak = pstate.current_streak;
                             let avg_speed = pstate.hop_speeds.iter().sum::<f32>()
                                 / pstate.hop_speeds.len() as f32;
-                            let max_speed = pstate
-                                .hop_speeds
-                                .iter()
-                                .cloned()
-                                .fold(0.0_f32, f32::max);
+                            let max_speed =
+                                pstate.hop_speeds.iter().cloned().fold(0.0_f32, f32::max);
                             let detection = Detection {
                                 tick: ticknum,
                                 algorithm: algo_name.clone(),
@@ -292,16 +288,16 @@ impl<'a> CheatAlgorithm<'a> for BunnyHop {
 
                             if pstate.current_streak >= min_streak as u32
                                 && pstate.current_streak > pstate.last_reported_streak
-                                && pstate.hop_ground_ticks.iter().all(|&g| g <= max_ground_ticks as u32)
+                                && pstate
+                                    .hop_ground_ticks
+                                    .iter()
+                                    .all(|&g| g <= max_ground_ticks as u32)
                             {
                                 pstate.last_reported_streak = pstate.current_streak;
                                 let avg_speed = pstate.hop_speeds.iter().sum::<f32>()
                                     / pstate.hop_speeds.len() as f32;
-                                let max_speed = pstate
-                                    .hop_speeds
-                                    .iter()
-                                    .cloned()
-                                    .fold(0.0_f32, f32::max);
+                                let max_speed =
+                                    pstate.hop_speeds.iter().cloned().fold(0.0_f32, f32::max);
                                 let detection = Detection {
                                     tick: ticknum,
                                     algorithm: algo_name.clone(),
@@ -365,6 +361,7 @@ mod tests {
 
     fn test_player(x: f32, flags: u32) -> Player {
         Player {
+            steam_id64: None,
             entity: EntityId::from(1u32),
             position: Vector { x, y: 0.0, z: 0.0 },
             health: 125,

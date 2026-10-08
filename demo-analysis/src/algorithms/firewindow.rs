@@ -56,10 +56,7 @@ impl FireWindow {
                 // How far a button span may sit from a console +attack window
                 // before it counts as injected input; covers the tick skew
                 // between the two streams.
-                (
-                    "fire_window_tolerance".to_string(),
-                    Parameter::Int(8),
-                ),
+                ("fire_window_tolerance".to_string(), Parameter::Int(8)),
             ]),
         }
     }
@@ -232,6 +229,7 @@ mod tests {
 
     fn recorder_player(state: &mut CheatAnalyserState) {
         state.players = vec![Player {
+            steam_id64: None,
             entity: EntityId::from(1u32),
             position: Default::default(),
             health: 125,

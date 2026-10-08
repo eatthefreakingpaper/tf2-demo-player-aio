@@ -189,8 +189,8 @@ impl Component for PreferencesModel {
                     set_title: "Performance",
 
                     adw::SpinRow {
-                        set_title: "Analysis threads",
-                        set_subtitle: "Number of threads used to run detection algorithms concurrently",
+                        set_title: "Analysis workers",
+                        set_subtitle: "Worker budget shared across demos during batch analysis",
                         set_digits: 0,
                         #[wrap(Some)]
                         set_adjustment = &gtk::Adjustment {
@@ -486,19 +486,21 @@ impl Component for PreferencesModel {
                     }
                 }
             }
-            PreferencesMsg::ProfileImport(text) => match crate::cheat_profiles::import_text(&text) {
-                Ok((config, warnings)) => {
-                    let algorithms = config.len();
-                    self.settings.cheat_algo_params = config;
-                    self.profile_status = format!(
-                        "Imported parameters for {algorithms} algorithms{}",
-                        Self::warning_suffix(&warnings)
-                    );
+            PreferencesMsg::ProfileImport(text) => {
+                match crate::cheat_profiles::import_text(&text) {
+                    Ok((config, warnings)) => {
+                        let algorithms = config.len();
+                        self.settings.cheat_algo_params = config;
+                        self.profile_status = format!(
+                            "Imported parameters for {algorithms} algorithms{}",
+                            Self::warning_suffix(&warnings)
+                        );
+                    }
+                    Err(e) => {
+                        self.profile_status = format!("Import failed: {e}");
+                    }
                 }
-                Err(e) => {
-                    self.profile_status = format!("Import failed: {e}");
-                }
-            },
+            }
             PreferencesMsg::ProfileReset => {
                 self.settings.cheat_algo_params.clear();
                 self.profile_status = "Reset every algorithm to its built-in parameters".to_owned();
@@ -587,7 +589,11 @@ impl Component for PreferencesModel {
 }
 
 impl PreferencesModel {
-    fn set_profile_dropdown_model(dropdown: &adw::ComboRow, names: &[String], selected: Option<&str>) {
+    fn set_profile_dropdown_model(
+        dropdown: &adw::ComboRow,
+        names: &[String],
+        selected: Option<&str>,
+    ) {
         let items: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         dropdown.set_model(Some(&gtk::StringList::new(&items)));
         if let Some(name) = selected {
@@ -611,7 +617,11 @@ impl PreferencesModel {
         }
     }
 
-    fn build_cheat_algo_rows(list: &gtk::ListBox, settings: &Settings, sender: &ComponentSender<Self>) {
+    fn build_cheat_algo_rows(
+        list: &gtk::ListBox,
+        settings: &Settings,
+        sender: &ComponentSender<Self>,
+    ) {
         for mut algo in get_algorithms()
             .into_iter()
             .sorted_by_key(|a| a.algorithm_name().to_string())
@@ -634,7 +644,10 @@ impl PreferencesModel {
                 let sender = sender.clone();
                 let name = name.clone();
                 switch.connect_active_notify(move |sw| {
-                    sender.input(PreferencesMsg::CheatAlgoEnabled(name.clone(), sw.is_active()));
+                    sender.input(PreferencesMsg::CheatAlgoEnabled(
+                        name.clone(),
+                        sw.is_active(),
+                    ));
                 });
             }
             row.add_suffix(&switch);

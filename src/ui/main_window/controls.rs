@@ -42,6 +42,7 @@ pub enum ControlsMsg {
     SeekForward,
     SeekBackward,
     ConvertReplay,
+    StripDemo,
     InspectDemo,
     DemoInspected(Demo),
     CheckCheaters,
@@ -183,6 +184,12 @@ impl AsyncComponent for ControlsModel {
                         set_icon_name: icon_names::VIDEO_CLIP,
                         set_tooltip_text: Some("Convert to replay"),
                         connect_clicked => ControlsMsg::ConvertReplay,
+                    },
+
+                    gtk::Button{
+                        set_label: "🥓",
+                        set_tooltip_text: Some("Strip all usercmds directly from the demo to prevent playback interference"),
+                        connect_clicked => ControlsMsg::StripDemo,
                     },
 
                     gtk::Button{
@@ -385,6 +392,27 @@ impl AsyncComponent for ControlsModel {
                                 &e.to_string(),
                             ),
                         };
+                    }
+                }
+            }
+            ControlsMsg::StripDemo => {
+                if let Some(demo) = &mut self.demo {
+                    match demo.strip_user_commands() {
+                        Ok(0) => util::notice_dialog(
+                            &self.window,
+                            "No user commands found",
+                            "The demo was already stripped.",
+                        ),
+                        Ok(count) => util::notice_dialog(
+                            &self.window,
+                            "Demo stripped successfully",
+                            &format!("Removed {count} user command packet(s)."),
+                        ),
+                        Err(error) => util::notice_dialog(
+                            &self.window,
+                            "Failed to strip demo",
+                            &error.to_string(),
+                        ),
                     }
                 }
             }

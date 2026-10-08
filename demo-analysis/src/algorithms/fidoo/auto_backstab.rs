@@ -120,9 +120,15 @@ impl AutoBackstab {
                 ("tracking_fov_threshold".to_string(), Parameter::Float(60.0)),
                 ("tracking_lookback_ticks".to_string(), Parameter::Int(15)),
                 ("aimbot_snap_threshold".to_string(), Parameter::Float(40.0)),
-                ("teleport_distance_threshold".to_string(), Parameter::Float(180.0)),
+                (
+                    "teleport_distance_threshold".to_string(),
+                    Parameter::Float(180.0),
+                ),
                 ("max_teleport_distance".to_string(), Parameter::Float(600.0)),
-                ("impossible_angle_threshold".to_string(), Parameter::Float(115.0)),
+                (
+                    "impossible_angle_threshold".to_string(),
+                    Parameter::Float(115.0),
+                ),
                 ("blind_fov_threshold".to_string(), Parameter::Float(85.0)),
                 ("preswing_check_ticks".to_string(), Parameter::Int(3)),
             ]),
@@ -182,11 +188,19 @@ impl AutoBackstab {
                                 z: (player.position.z - prev.position.z) / dt,
                             }
                         } else {
-                            Vector { x: 0.0, y: 0.0, z: 0.0 }
+                            Vector {
+                                x: 0.0,
+                                y: 0.0,
+                                z: 0.0,
+                            }
                         }
                     })
                 })
-                .unwrap_or(Vector { x: 0.0, y: 0.0, z: 0.0 });
+                .unwrap_or(Vector {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                });
 
             let snapshot = PlayerSnapshot {
                 tick,
@@ -214,12 +228,7 @@ impl AutoBackstab {
     }
 
     /// Check if the Spy maintained visual tracking of the victim prior to the attack
-    fn check_prior_tracking(
-        &self,
-        spy_sid: u64,
-        victim_sid: u64,
-        t_ref: u32,
-    ) -> (bool, f32, f32) {
+    fn check_prior_tracking(&self, spy_sid: u64, victim_sid: u64, t_ref: u32) -> (bool, f32, f32) {
         let Some(spy_history) = self.player_histories.get(&spy_sid) else {
             return (false, 0.0, 0.0);
         };
@@ -229,8 +238,7 @@ impl AutoBackstab {
 
         let lookback_ticks =
             get_parameter_value::<i32>(&self.params, "tracking_lookback_ticks").max(5) as u32;
-        let fov_threshold =
-            get_parameter_value::<f32>(&self.params, "tracking_fov_threshold");
+        let fov_threshold = get_parameter_value::<f32>(&self.params, "tracking_fov_threshold");
         let min_tracking =
             get_parameter_value::<i32>(&self.params, "min_tracking_ticks").max(1) as u32;
 
@@ -324,7 +332,8 @@ impl AutoBackstab {
 
         for window in snaps.windows(2) {
             let angle_delta =
-                ((window[1].view_angle - window[0].view_angle + 180.0).rem_euclid(360.0) - 180.0).abs();
+                ((window[1].view_angle - window[0].view_angle + 180.0).rem_euclid(360.0) - 180.0)
+                    .abs();
             if angle_delta > max_flick {
                 max_flick = angle_delta;
             }
@@ -416,7 +425,7 @@ impl<'a> CheatAlgorithm<'a> for AutoBackstab {
                     let mut ready_prop = None;
                     let mut owner_prop = None;
 
-                    for prop in entity.props(parser_state) {
+                    for prop in state.entity_props(entity, parser_state).iter() {
                         if let Some((_, prop_name)) = prop.identifier.names() {
                             match prop_name.as_str() {
                                 "m_bReadyToBackstab" => {
@@ -439,7 +448,8 @@ impl<'a> CheatAlgorithm<'a> for AutoBackstab {
                     }
 
                     if is_knife_class || ready_prop.is_some() {
-                        let knife_entry = self.knife_entities.entry(entity.entity_index).or_default();
+                        let knife_entry =
+                            self.knife_entities.entry(entity.entity_index).or_default();
                         if let Some(owner) = owner_prop {
                             knife_entry.owner_entity = Some(owner);
                         }
@@ -534,10 +544,14 @@ impl<'a> CheatAlgorithm<'a> for AutoBackstab {
                         }
 
                         if attacker_sid != 0 && victim_sid != 0 {
-                            let attacker_opt =
-                                state.players.iter().find(|p| player_id(p) == Some(attacker_sid));
-                            let victim_opt =
-                                state.players.iter().find(|p| player_id(p) == Some(victim_sid));
+                            let attacker_opt = state
+                                .players
+                                .iter()
+                                .find(|p| player_id(p) == Some(attacker_sid));
+                            let victim_opt = state
+                                .players
+                                .iter()
+                                .find(|p| player_id(p) == Some(victim_sid));
 
                             if let (Some(attacker), Some(victim)) = (attacker_opt, victim_opt) {
                                 if attacker.in_pvs && victim.in_pvs && !attacker.is_taunting() {
@@ -561,10 +575,11 @@ impl<'a> CheatAlgorithm<'a> for AutoBackstab {
                                             - 180.0)
                                             .abs();
 
-                                        let angle_diff = ((attacker.view_angle - victim.view_angle + 180.0)
-                                            .rem_euclid(360.0)
-                                            - 180.0)
-                                            .abs();
+                                        let angle_diff =
+                                            ((attacker.view_angle - victim.view_angle + 180.0)
+                                                .rem_euclid(360.0)
+                                                - 180.0)
+                                                .abs();
 
                                         let tracker =
                                             self.spy_states.entry(attacker_sid).or_default();
@@ -599,7 +614,8 @@ impl<'a> CheatAlgorithm<'a> for AutoBackstab {
                                             &self.params,
                                             "preswing_check_ticks",
                                         )
-                                        .max(0) as u32;
+                                        .max(0)
+                                            as u32;
 
                                         let was_preswinging = if let Some(t_r) = t_ready_opt {
                                             tracker.recent_attacks.iter().any(|&atk_tick| {
@@ -611,12 +627,8 @@ impl<'a> CheatAlgorithm<'a> for AutoBackstab {
                                         };
 
                                         let t_ref = t_ready_opt.unwrap_or(t_attack);
-                                        let (had_tracking, avg_fov, _last_fov) =
-                                            self.check_prior_tracking(
-                                                attacker_sid,
-                                                victim_sid,
-                                                t_ref,
-                                            );
+                                        let (had_tracking, avg_fov, _last_fov) = self
+                                            .check_prior_tracking(attacker_sid, victim_sid, t_ref);
                                         let victim_moving =
                                             self.check_victim_movement(victim_sid, t_attack);
                                         let (had_snap, flick_2tick) =
@@ -632,17 +644,20 @@ impl<'a> CheatAlgorithm<'a> for AutoBackstab {
                                             &self.params,
                                             "max_instant_trigger_ticks",
                                         )
-                                        .max(0) as u32;
+                                        .max(0)
+                                            as u32;
                                         let fleeting_max = get_parameter_value::<i32>(
                                             &self.params,
                                             "fleeting_window_max_ticks",
                                         )
-                                        .max(0) as u32;
+                                        .max(0)
+                                            as u32;
                                         let fleeting_reaction_max = get_parameter_value::<i32>(
                                             &self.params,
                                             "fleeting_reaction_max_ticks",
                                         )
-                                        .max(0) as u32;
+                                        .max(0)
+                                            as u32;
                                         let teleport_dist_thresh = get_parameter_value::<f32>(
                                             &self.params,
                                             "teleport_distance_threshold",
@@ -669,23 +684,30 @@ impl<'a> CheatAlgorithm<'a> for AutoBackstab {
                                         });
 
                                         // 2. Fleeting window exploit: Brief window <= fleeting_max with fast attack and no prior tracking
-                                        let is_fleeting_exploit = match (reaction_ticks, window_dur_opt) {
-                                            (Some(r), Some(w)) => {
-                                                w <= fleeting_max
-                                                    && r <= fleeting_reaction_max
-                                                    && !was_preswinging
-                                                    && !had_tracking
-                                                    && approach_quality < 0.3
-                                            }
-                                            _ => false,
-                                        };
+                                        let is_fleeting_exploit =
+                                            match (reaction_ticks, window_dur_opt) {
+                                                (Some(r), Some(w)) => {
+                                                    w <= fleeting_max
+                                                        && r <= fleeting_reaction_max
+                                                        && !was_preswinging
+                                                        && !had_tracking
+                                                        && approach_quality < 0.3
+                                                }
+                                                _ => false,
+                                            };
 
                                         // 3. Aimbot snap backstab: Large flick > 40 deg leading into backstab without tracking, or > 45 deg snap to impossible angle
-                                        let is_snap_backstab = (had_snap && !had_tracking && approach_quality < 0.35)
-                                            || (flick_2tick >= 45.0 && aim_fov <= 35.0 && angle_diff >= 75.0 && !had_tracking && !was_preswinging);
+                                        let is_snap_backstab =
+                                            (had_snap && !had_tracking && approach_quality < 0.35)
+                                                || (flick_2tick >= 45.0
+                                                    && aim_fov <= 35.0
+                                                    && angle_diff >= 75.0
+                                                    && !had_tracking
+                                                    && !was_preswinging);
 
                                         // 4. Impossible angle backstab: Attacker and victim facing each other in real-time (> 115 deg)
-                                        let is_impossible_angle = angle_diff > imp_angle_thresh && !was_preswinging;
+                                        let is_impossible_angle =
+                                            angle_diff > imp_angle_thresh && !was_preswinging;
 
                                         // 5. Backtrack Tele-stab distance: Attacker landed backstab beyond valid melee reach (180 - 600 HU)
                                         let is_teleport_distance = dist2d > teleport_dist_thresh
@@ -744,7 +766,11 @@ impl<'a> CheatAlgorithm<'a> for AutoBackstab {
                                             victim_id: victim_uid,
                                             victim_class: victim_class_str,
                                             victim_pos: [victim_pos.x, victim_pos.y, victim_pos.z],
-                                            spy_pos: [attacker_pos.x, attacker_pos.y, attacker_pos.z],
+                                            spy_pos: [
+                                                attacker_pos.x,
+                                                attacker_pos.y,
+                                                attacker_pos.z,
+                                            ],
                                             dist2d,
                                             dist3d,
                                             angle_diff,
@@ -772,7 +798,10 @@ impl<'a> CheatAlgorithm<'a> for AutoBackstab {
                                             || is_teleport_distance
                                             || is_blind_triggerbot
                                         {
-                                            if self.logged_detections.insert((attacker_sid, t_attack)) {
+                                            if self
+                                                .logged_detections
+                                                .insert((attacker_sid, t_attack))
+                                            {
                                                 let detection = Detection {
                                                     tick: t_attack,
                                                     algorithm: self.algorithm_name().to_string(),
@@ -837,10 +866,9 @@ impl<'a> CheatAlgorithm<'a> for AutoBackstab {
     }
 
     fn finish(&mut self) -> Result<Vec<Detection>, Error> {
-        let min_stabs_aggregate = get_parameter_value::<i32>(&self.params, "min_stabs_aggregate")
-            .max(1) as usize;
-        let max_mean_reaction =
-            get_parameter_value::<f32>(&self.params, "max_mean_reaction_ticks");
+        let min_stabs_aggregate =
+            get_parameter_value::<i32>(&self.params, "min_stabs_aggregate").max(1) as usize;
+        let max_mean_reaction = get_parameter_value::<f32>(&self.params, "max_mean_reaction_ticks");
         let max_std_dev = get_parameter_value::<f32>(&self.params, "max_std_dev_ticks");
 
         let mut aggregate_detections = Vec::new();
@@ -901,11 +929,7 @@ impl<'a> CheatAlgorithm<'a> for AutoBackstab {
 }
 
 fn player_id(player: &Player) -> Option<u64> {
-    let info = player.info.as_ref()?;
-    if info.steam_id == "BOT" {
-        return None;
-    }
-    SteamID::from_steam3(&info.steam_id).ok().map(u64::from)
+    player.steam_id()
 }
 
 fn format_class_name(class: Class) -> &'static str {
@@ -939,6 +963,7 @@ mod tests {
         health: u16,
     ) -> Player {
         Player {
+            steam_id64: None,
             entity: EntityId::from(entity_id),
             position: pos,
             health,
@@ -987,8 +1012,30 @@ mod tests {
         let spy_sid = u64::from(SteamID::from_steam3(spy_steam).unwrap());
         let medic_sid = u64::from(SteamID::from_steam3(medic_steam).unwrap());
 
-        let spy = create_test_player(1, 1, spy_steam, Class::Spy, Vector { x: 890.0, y: -320.0, z: 128.0 }, 125);
-        let medic = create_test_player(2, 6, medic_steam, Class::Medic, Vector { x: 840.5, y: -310.2, z: 128.0 }, 150);
+        let spy = create_test_player(
+            1,
+            1,
+            spy_steam,
+            Class::Spy,
+            Vector {
+                x: 890.0,
+                y: -320.0,
+                z: 128.0,
+            },
+            125,
+        );
+        let medic = create_test_player(
+            2,
+            6,
+            medic_steam,
+            Class::Medic,
+            Vector {
+                x: 840.5,
+                y: -310.2,
+                z: 128.0,
+            },
+            150,
+        );
 
         state.players = vec![spy, medic];
         state.set_entid_to_userid(EntityId::from(1u32), UserId::from(1u16));
@@ -1016,7 +1063,9 @@ mod tests {
 
         let msg = create_hurt_message(hurt_event);
 
-        let detections = algo.on_message(&msg, &state, &parser_state, 24530.into()).unwrap();
+        let detections = algo
+            .on_message(&msg, &state, &parser_state, 24530.into())
+            .unwrap();
         assert_eq!(detections.len(), 1);
         assert_eq!(detections[0].algorithm, "fidoo/auto_backstab");
         assert_eq!(detections[0].player, spy_sid);
@@ -1039,9 +1088,31 @@ mod tests {
         for tick in 19295..=19310 {
             state.tick = tick.into();
             let spy_x = -200.0 + (tick - 19295) as f32 * 10.0;
-            let mut spy = create_test_player(1, 1, spy_steam, Class::Spy, Vector { x: spy_x, y: 0.0, z: 0.0 }, 125);
+            let mut spy = create_test_player(
+                1,
+                1,
+                spy_steam,
+                Class::Spy,
+                Vector {
+                    x: spy_x,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                125,
+            );
             spy.view_angle = 0.0;
-            let mut pyro = create_test_player(2, 6, pyro_steam, Class::Pyro, Vector { x: 0.0, y: 0.0, z: 0.0 }, 175);
+            let mut pyro = create_test_player(
+                2,
+                6,
+                pyro_steam,
+                Class::Pyro,
+                Vector {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                175,
+            );
             pyro.view_angle = 0.0;
 
             state.players = vec![spy, pyro];
@@ -1071,7 +1142,9 @@ mod tests {
 
         let msg = create_hurt_message(hurt_event);
 
-        let detections = algo.on_message(&msg, &state, &parser_state, 19311.into()).unwrap();
+        let detections = algo
+            .on_message(&msg, &state, &parser_state, 19311.into())
+            .unwrap();
         assert_eq!(detections.len(), 0);
     }
 
@@ -1085,8 +1158,30 @@ mod tests {
         let spy_sid = u64::from(SteamID::from_steam3(spy_steam).unwrap());
         let medic_sid = u64::from(SteamID::from_steam3(medic_steam).unwrap());
 
-        let spy = create_test_player(1, 1, spy_steam, Class::Spy, Vector { x: 890.0, y: -320.0, z: 128.0 }, 125);
-        let medic = create_test_player(2, 6, medic_steam, Class::Medic, Vector { x: 840.5, y: -310.2, z: 128.0 }, 150);
+        let spy = create_test_player(
+            1,
+            1,
+            spy_steam,
+            Class::Spy,
+            Vector {
+                x: 890.0,
+                y: -320.0,
+                z: 128.0,
+            },
+            125,
+        );
+        let medic = create_test_player(
+            2,
+            6,
+            medic_steam,
+            Class::Medic,
+            Vector {
+                x: 840.5,
+                y: -310.2,
+                z: 128.0,
+            },
+            150,
+        );
 
         state.players = vec![spy, medic];
         state.set_entid_to_userid(EntityId::from(1u32), UserId::from(1u16));
@@ -1117,7 +1212,9 @@ mod tests {
 
         let msg = create_hurt_message(hurt_event);
 
-        let detections = algo.on_message(&msg, &state, &parser_state, 24529.into()).unwrap();
+        let detections = algo
+            .on_message(&msg, &state, &parser_state, 24529.into())
+            .unwrap();
         assert_eq!(detections.len(), 0);
     }
 
@@ -1131,9 +1228,31 @@ mod tests {
         let spy_sid = u64::from(SteamID::from_steam3(spy_steam).unwrap());
         let sniper_sid = u64::from(SteamID::from_steam3(sniper_steam).unwrap());
 
-        let mut spy = create_test_player(1, 1, spy_steam, Class::Spy, Vector { x: 890.0, y: -320.0, z: 128.0 }, 125);
+        let mut spy = create_test_player(
+            1,
+            1,
+            spy_steam,
+            Class::Spy,
+            Vector {
+                x: 890.0,
+                y: -320.0,
+                z: 128.0,
+            },
+            125,
+        );
         spy.view_angle = 180.0;
-        let mut sniper = create_test_player(2, 6, sniper_steam, Class::Sniper, Vector { x: 840.5, y: -320.0, z: 128.0 }, 125);
+        let mut sniper = create_test_player(
+            2,
+            6,
+            sniper_steam,
+            Class::Sniper,
+            Vector {
+                x: 840.5,
+                y: -320.0,
+                z: 128.0,
+            },
+            125,
+        );
         sniper.view_angle = 180.0;
 
         state.players = vec![spy, sniper];
@@ -1162,7 +1281,9 @@ mod tests {
 
         let msg = create_hurt_message(hurt_event);
 
-        let detections = algo.on_message(&msg, &state, &parser_state, 24512.into()).unwrap();
+        let detections = algo
+            .on_message(&msg, &state, &parser_state, 24512.into())
+            .unwrap();
         assert_eq!(detections.len(), 0);
 
         let finish_detections = algo.finish().unwrap();
@@ -1179,8 +1300,30 @@ mod tests {
         let spy_sid = u64::from(SteamID::from_steam3(spy_steam).unwrap());
         let medic_sid = u64::from(SteamID::from_steam3(medic_steam).unwrap());
 
-        let spy = create_test_player(1, 1, spy_steam, Class::Spy, Vector { x: 1000.0, y: 0.0, z: 0.0 }, 125);
-        let medic = create_test_player(2, 6, medic_steam, Class::Medic, Vector { x: 1220.0, y: 0.0, z: 0.0 }, 150);
+        let spy = create_test_player(
+            1,
+            1,
+            spy_steam,
+            Class::Spy,
+            Vector {
+                x: 1000.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            125,
+        );
+        let medic = create_test_player(
+            2,
+            6,
+            medic_steam,
+            Class::Medic,
+            Vector {
+                x: 1220.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            150,
+        );
 
         state.players = vec![spy, medic];
         state.set_entid_to_userid(EntityId::from(1u32), UserId::from(1u16));
@@ -1206,7 +1349,9 @@ mod tests {
 
         let msg = create_hurt_message(hurt_event);
 
-        let detections = algo.on_message(&msg, &state, &parser_state, 1000.into()).unwrap();
+        let detections = algo
+            .on_message(&msg, &state, &parser_state, 1000.into())
+            .unwrap();
         assert_eq!(detections.len(), 1);
         assert_eq!(detections[0].player, spy_sid);
     }

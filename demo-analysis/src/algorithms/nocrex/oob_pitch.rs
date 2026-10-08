@@ -1,23 +1,20 @@
 // Written by Nocrex
 
-use std::{collections::{HashMap, HashSet}};
+use std::collections::{HashMap, HashSet};
 
-use crate::{
-    base::cheat_analyser_base::{CheatAnalyserState, PlayerState}
-};
+use crate::base::cheat_analyser_base::{CheatAnalyserState, PlayerState};
 
 use anyhow::Error;
 use serde_json::json;
-use steamid_ng::SteamID;
-use tf_demo_parser::{ParserState, demo::message::Message};
+use tf_demo_parser::{demo::message::Message, ParserState};
 
 use crate::lib::algorithm::{CheatAlgorithm, Detection};
-use crate::lib::parameters::{Parameter, Parameters, get_parameter_value};
+use crate::lib::parameters::{get_parameter_value, Parameter, Parameters};
 
 pub struct OOBPitch {
-    last_detections: HashSet<String>,
+    last_detections: HashSet<u64>,
     server_name: String,
-    
+
     params: Parameters,
 }
 
@@ -45,14 +42,19 @@ impl<'a> CheatAlgorithm<'a> for OOBPitch {
     }
 
     fn handled_messages(&self) -> Result<Vec<tf_demo_parser::MessageType>, bool> {
-        Ok(vec![tf_demo_parser::MessageType::ServerInfo, tf_demo_parser::MessageType::NetTick])
+        Ok(vec![
+            tf_demo_parser::MessageType::ServerInfo,
+            tf_demo_parser::MessageType::NetTick,
+        ])
     }
 
-    fn on_message(&mut self,
+    fn on_message(
+        &mut self,
         message: &Message,
         state: &CheatAnalyserState,
         _: &ParserState,
-        _: tf_demo_parser::demo::data::DemoTick) -> Result<Vec<Detection>, Error> {
+        _: tf_demo_parser::demo::data::DemoTick,
+    ) -> Result<Vec<Detection>, Error> {
         let mut submitted_detections = Vec::new();
 
         if let Message::ServerInfo(event) = message {
@@ -60,7 +62,7 @@ impl<'a> CheatAlgorithm<'a> for OOBPitch {
                 self.server_name = event.server_name.trim().to_string();
             }
         }
-        
+
         if let Message::NetTick(_) = message {
             let ticknum = u32::from(state.tick);
             let players = &state.players;
@@ -77,22 +79,19 @@ impl<'a> CheatAlgorithm<'a> for OOBPitch {
                     && p.state == PlayerState::Alive
                     && p.info.as_ref().is_some_and(|info| info.steam_id != "BOT")
             }) {
-                let info = match &player.info {
-                    Some(info) => info,
-                    None => continue,
+                let Some(steam_id) = player.steam_id() else {
+                    continue;
                 };
 
-                let steam_id = &info.steam_id;
-
                 if !(min_pitch..=max_pitch).contains(&player.pitch_angle) {
-                    detections.insert(steam_id.clone());
-                    if !self.last_detections.contains(steam_id){
+                    detections.insert(steam_id);
+                    if !self.last_detections.contains(&steam_id) {
                         let class_name = player.class_name();
                         let weapon_name = state.get_player_weapon(player);
                         submitted_detections.push(Detection {
                             tick: ticknum,
                             algorithm: self.algorithm_name().to_string(),
-                            player: u64::from(SteamID::from_steam3(&steam_id).unwrap()),
+                            player: steam_id,
                             data: json!({
                                 "class": class_name,
                                 "weapon": weapon_name,
@@ -105,13 +104,11 @@ impl<'a> CheatAlgorithm<'a> for OOBPitch {
             }
 
             self.last_detections = detections;
-
         }
 
         Ok(submitted_detections)
-
     }
-    
+
     fn params(&mut self) -> Option<&mut Parameters> {
         Some(&mut self.params)
     }

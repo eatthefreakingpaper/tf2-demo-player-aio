@@ -13,7 +13,14 @@ use crate::base::cheat_analyser_base::{CheatAnalyserState, Player};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RecorderCmd {
     pub demo_tick: u32,
+    /// Sequence number written in the outer `dem_usercmd` packet header.
     pub command_number: u32,
+    /// `CUserCmd::command_number` encoded inside the packet payload.
+    ///
+    /// Vanilla TF2 assigns this from the same sequence passed to
+    /// `RecordUserInput`. Keeping both values exposes clients which rewrite the
+    /// command number after `CreateMove`, such as Amalgam's crit seed search.
+    pub encoded_command_number: u32,
     pub tick_count: u32,
     pub yaw: f32,
     pub pitch: f32,
@@ -27,6 +34,7 @@ impl RecorderCmd {
         Self {
             demo_tick: u32::from(packet.tick),
             command_number: packet.sequence_out,
+            encoded_command_number: packet.cmd.command_number.unwrap_or(1),
             tick_count: packet.cmd.tick_count.unwrap_or(1),
             yaw: packet.cmd.view_angles[1].unwrap_or_default(),
             pitch: packet.cmd.view_angles[0].unwrap_or_default(),
@@ -41,23 +49,33 @@ impl RecorderCmd {
     }
 
     pub fn is_contiguous_after(self, previous: Self) -> bool {
+        self.is_transport_contiguous_after(previous) && self.has_expected_tick_after(previous)
+    }
+
+    /// Whether two commands are adjacent in the recorded command stream.
+    ///
+    /// This deliberately does not inspect `tick_count`: a cheat may rewrite
+    /// that field while the demo packet sequence remains perfectly adjacent.
+    pub fn is_transport_contiguous_after(self, previous: Self) -> bool {
         self.demo_tick >= previous.demo_tick
             && self.demo_tick - previous.demo_tick <= 16
             && self.command_number == previous.command_number.wrapping_add(1)
-            && self.tick_count == previous.tick_count.wrapping_add(1)
+    }
+
+    pub fn has_expected_tick_after(self, previous: Self) -> bool {
+        self.tick_count == previous.tick_count.wrapping_add(1)
     }
 }
 
 pub fn player_steam_id(player: &Player) -> Option<u64> {
-    let info = player.info.as_ref()?;
-    SteamID::from_steam3(&info.steam_id).map(u64::from).ok()
+    player.steam_id64.or_else(|| {
+        let info = player.info.as_ref()?;
+        SteamID::from_steam3(&info.steam_id).map(u64::from).ok()
+    })
 }
 
 pub fn recorder_player(state: &CheatAnalyserState, recorder_sid: u64) -> Option<&Player> {
-    state
-        .players
-        .iter()
-        .find(|player| player_steam_id(player) == Some(recorder_sid))
+    state.get_player_by_sid(recorder_sid)
 }
 
 /// Resolves the recorder only when the header nickname maps to one SteamID.
@@ -120,6 +138,7 @@ mod tests {
         let decoded = RecorderCmd::from_packet(&packet());
         assert_eq!(decoded.demo_tick, 25);
         assert_eq!(decoded.command_number, 7);
+        assert_eq!(decoded.encoded_command_number, 10);
         assert_eq!(decoded.tick_count, 20);
         assert_eq!(decoded.yaw, 91.25);
         assert_eq!(decoded.pitch, -12.5);
@@ -136,7 +155,14 @@ mod tests {
         empty.cmd.mouse_dx = None;
         empty.cmd.mouse_dy = None;
         let decoded = RecorderCmd::from_packet(&empty);
-        assert_eq!((decoded.command_number, decoded.tick_count), (7, 1));
+        assert_eq!(
+            (
+                decoded.command_number,
+                decoded.encoded_command_number,
+                decoded.tick_count
+            ),
+            (7, 1, 1)
+        );
         assert_eq!((decoded.yaw, decoded.pitch), (0.0, 0.0));
         assert_eq!(decoded.buttons, 0);
         assert_eq!((decoded.mouse_dx, decoded.mouse_dy), (0, 0));
@@ -151,6 +177,8 @@ mod tests {
         second_packet.cmd.command_number = Some(11);
         second_packet.cmd.tick_count = Some(21);
         let second = RecorderCmd::from_packet(&second_packet);
+        assert!(second.is_transport_contiguous_after(first));
+        assert!(second.has_expected_tick_after(first));
         assert!(second.is_contiguous_after(first));
 
         second_packet.sequence_out = 10;
@@ -159,6 +187,12 @@ mod tests {
 
         second_packet.sequence_out = 8;
         second_packet.cmd.command_number = Some(11);
+        second_packet.cmd.tick_count = Some(18);
+        let rewritten = RecorderCmd::from_packet(&second_packet);
+        assert!(rewritten.is_transport_contiguous_after(first));
+        assert!(!rewritten.has_expected_tick_after(first));
+        assert!(!rewritten.is_contiguous_after(first));
+
         second_packet.cmd.tick_count = Some(21);
         second_packet.tick = DemoTick::from(24);
         assert!(!RecorderCmd::from_packet(&second_packet).is_contiguous_after(first));

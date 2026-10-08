@@ -5,12 +5,12 @@
 // Additional functionality that has broad utility can be merged into this base analyser.
 
 use anyhow::Error;
-use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
 use std::str::FromStr;
-use std::sync::Mutex;
 use steamid_ng::SteamID;
 use tf_demo_parser::demo::data::DemoTick;
 use tf_demo_parser::demo::gameevent_gen::ObjectDestroyedEvent;
@@ -31,8 +31,8 @@ use tf_demo_parser::demo::vector::{Vector, VectorXY};
 use tf_demo_parser::{MessageType, ParserState, ReadResult, Stream};
 use web_time::Instant;
 
-use crate::lib::algorithm::{CheatAlgorithm, Detection};
 use crate::dev_print;
+use crate::lib::algorithm::{CheatAlgorithm, Detection};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub enum PlayerState {
@@ -66,6 +66,10 @@ pub struct Player {
     pub pitch_angle: f32,
     pub state: PlayerState,
     pub info: Option<UserInfo>,
+    // Parsed once from userinfo and reused by every detector. Tests and old
+    // serialized states can leave this empty; helper methods fall back to info.
+    #[serde(default)]
+    pub steam_id64: Option<u64>,
     pub charge: u8,
     pub simtime: u16,
     pub ping: u16,
@@ -80,6 +84,16 @@ pub struct Player {
 }
 
 impl Player {
+    pub fn steam_id(&self) -> Option<u64> {
+        self.steam_id64.or_else(|| {
+            let info = self.info.as_ref()?;
+            if info.steam_id == "BOT" {
+                return None;
+            }
+            SteamID::from_steam3(&info.steam_id).map(u64::from).ok()
+        })
+    }
+
     pub fn is_on_ground(&self) -> bool {
         (self.flags & 1) != 0
     }
@@ -153,6 +167,24 @@ impl Player {
 
     pub fn is_marked_for_death(&self) -> bool {
         (self.cond & (1 << 30)) != 0
+    }
+
+    pub fn is_crit_boosted(&self) -> bool {
+        // These are the unconditional, all-weapon cases checked by
+        // CTFPlayerShared::IsCritBoosted. Condition 105 (the temporary rune
+        // boost) is not available because this parser does not retain
+        // m_nPlayerCondEx3; condition 44 is handled per active weapon by TF2.
+        (self.cond & (1 << 11)) != 0
+            || (self.cond_ex
+                & ((1 << (33 - 32))
+                    | (1 << (34 - 32))
+                    | (1 << (35 - 32))
+                    | (1 << (37 - 32))
+                    | (1 << (38 - 32))
+                    | (1 << (39 - 32))
+                    | (1 << (40 - 32))
+                    | (1 << (56 - 32))))
+                != 0
     }
 
     pub fn has_visible_effect(&self) -> bool {
@@ -376,13 +408,26 @@ pub struct WeaponEntity {
 
 impl WeaponEntity {
     pub fn name(&self, player_class: Class) -> String {
-        crate::util::helpers::weapon_name_from_id_or_class(self.item_def_index, &self.class_name, player_class)
+        crate::util::helpers::weapon_name_from_id_or_class(
+            self.item_def_index,
+            &self.class_name,
+            player_class,
+        )
     }
 }
 
 #[derive(Default, Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct CheatAnalyserState {
     pub players: Vec<Player>,
+    #[serde(skip)]
+    player_index_by_entity: HashMap<EntityId, usize>,
+    #[serde(skip)]
+    player_index_by_sid: HashMap<u64, usize>,
+    // Baseline-expanded Enter properties for the current PacketEntities
+    // message. Algorithms share this instead of independently expanding the
+    // same entity.
+    #[serde(skip)]
+    pub resolved_entity_props: HashMap<EntityId, Vec<SendProp>>,
     pub player_names: HashMap<u64, String>,
     pub user_info_history: HashMap<u64, UserInfo>,
     pub entid_to_userid: HashMap<EntityId, UserId>,
@@ -428,38 +473,121 @@ impl CheatAnalyserState {
     }
 
     pub fn get_player_class_and_weapon_by_sid(&self, sid: u64) -> (&'static str, String) {
-        if let Some(player) = self.players.iter().find(|p| {
-            p.info.as_ref().is_some_and(|info| {
-                SteamID::from_steam3(&info.steam_id).map(u64::from).ok() == Some(sid)
-            })
-        }) {
+        if let Some(player) = self.get_player_by_sid(sid) {
             (player.class_name(), self.get_player_weapon(player))
         } else {
             ("unknown", "unknown".to_string())
         }
     }
 
-    pub fn get_or_create_player(&mut self, entity_id: EntityId) -> &mut Player {
-        let index = match self
+    pub fn get_player_by_entity(&self, entity_id: EntityId) -> Option<&Player> {
+        self.player_index_by_entity
+            .get(&entity_id)
+            .and_then(|index| self.players.get(*index))
+            .filter(|player| player.entity == entity_id)
+            .or_else(|| {
+                self.players
+                    .iter()
+                    .find(|player| player.entity == entity_id)
+            })
+    }
+
+    pub fn get_player_by_sid(&self, sid: u64) -> Option<&Player> {
+        self.player_index_by_sid
+            .get(&sid)
+            .and_then(|index| self.players.get(*index))
+            .filter(|player| player.steam_id64 == Some(sid))
+            .or_else(|| {
+                self.players.iter().find(|player| {
+                    player.steam_id64 == Some(sid)
+                        || player.info.as_ref().is_some_and(|info| {
+                            SteamID::from_steam3(&info.steam_id).map(u64::from).ok() == Some(sid)
+                        })
+                })
+            })
+    }
+
+    fn find_player_index_by_entity(&mut self, entity_id: EntityId) -> Option<usize> {
+        if let Some(index) = self
+            .player_index_by_entity
+            .get(&entity_id)
+            .copied()
+            .filter(|index| {
+                self.players
+                    .get(*index)
+                    .is_some_and(|player| player.entity == entity_id)
+            })
+        {
+            return Some(index);
+        }
+
+        let index = self
             .players
             .iter()
-            .enumerate()
-            .find(|(_index, player)| player.entity == entity_id)
-            .map(|(index, _)| index)
-        {
-            Some(index) => index,
-            None => {
+            .position(|player| player.entity == entity_id)?;
+        self.player_index_by_entity.insert(entity_id, index);
+        if let Some(sid) = self.players[index].steam_id64 {
+            self.player_index_by_sid.insert(sid, index);
+        }
+        Some(index)
+    }
+
+    pub fn get_player_by_entity_mut(&mut self, entity_id: EntityId) -> Option<&mut Player> {
+        let index = self.find_player_index_by_entity(entity_id)?;
+        self.players.get_mut(index)
+    }
+
+    pub fn get_or_create_player(&mut self, entity_id: EntityId) -> &mut Player {
+        let index = self
+            .find_player_index_by_entity(entity_id)
+            .unwrap_or_else(|| {
                 let index = self.players.len();
                 self.players.push(Player {
                     entity: entity_id,
                     ..Player::default()
                 });
+                self.player_index_by_entity.insert(entity_id, index);
                 index
-            }
-        };
-
-        #[allow(clippy::indexing_slicing)]
+            });
         &mut self.players[index]
+    }
+
+    pub fn set_player_steam_id(&mut self, entity_id: EntityId, sid: u64) {
+        let player = self.get_or_create_player(entity_id);
+        player.steam_id64 = Some(sid);
+        let index = self.player_index_by_entity[&entity_id];
+        self.player_index_by_sid.insert(sid, index);
+    }
+
+    pub fn steam_id_for_entity(&self, entity_id: EntityId) -> Option<u64> {
+        self.get_player_by_entity(entity_id)
+            .and_then(|player| {
+                player.steam_id64.or_else(|| {
+                    player
+                        .info
+                        .as_ref()
+                        .and_then(|info| SteamID::from_steam3(&info.steam_id).map(u64::from).ok())
+                })
+            })
+            .or_else(|| {
+                self.get_userid_from_entid(entity_id)
+                    .and_then(|user_id| self.get_id64_from_userid(user_id))
+            })
+    }
+
+    pub fn entity_props<'b>(
+        &'b self,
+        entity: &'b PacketEntity,
+        parser_state: &'b ParserState,
+    ) -> Cow<'b, [SendProp]> {
+        if entity.update_type == UpdateType::Enter {
+            if let Some(props) = self.resolved_entity_props.get(&entity.entity_index) {
+                return Cow::Borrowed(props);
+            }
+            Cow::Owned(entity.props(parser_state).collect())
+        } else {
+            Cow::Borrowed(entity.props.as_slice())
+        }
     }
     pub fn get_userid_from_entid(&self, entid: EntityId) -> Option<UserId> {
         self.entid_to_userid.get(&entid).copied()
@@ -492,18 +620,24 @@ impl CheatAnalyserState {
     }
 }
 
-// ParserState requires a non-self impl of does_handle so I had to create this.
-lazy_static! {
-    static ref HANDLED_MESSAGE_TYPES: Mutex<Vec<MessageType>> = Mutex::new(vec![
-        MessageType::PacketEntities,
-        MessageType::GameEvent,
-        MessageType::NetTick
-    ]);
+// ParserState requires a static callback. A bit mask keeps this callback lock-free;
+// MessageType is repr(u8) and its highest current value is 32.
+const fn message_type_mask(message_type: MessageType) -> u64 {
+    1_u64 << (message_type as u8)
+}
+
+const BASE_MESSAGE_MASK: u64 = message_type_mask(MessageType::PacketEntities)
+    | message_type_mask(MessageType::GameEvent)
+    | message_type_mask(MessageType::NetTick);
+
+thread_local! {
+    static HANDLED_MESSAGE_MASK: Cell<u64> = const { Cell::new(BASE_MESSAGE_MASK) };
 }
 
 pub struct CheatAnalyser<'a> {
     pub state: CheatAnalyserState,
     pub algorithms: Vec<Box<dyn CheatAlgorithm<'a> + 'a + Send>>,
+    algorithm_message_masks: Vec<u64>,
     pub detections: Vec<Detection>,
     pub header: Option<Header>,
     pub tick: DemoTick,
@@ -518,6 +652,7 @@ impl<'a> Default for CheatAnalyser<'a> {
         Self {
             state: Default::default(),
             algorithms: Default::default(),
+            algorithm_message_masks: Default::default(),
             detections: Default::default(),
             header: Default::default(),
             tick: Default::default(),
@@ -533,8 +668,7 @@ impl MessageHandler for CheatAnalyser<'_> {
     type Output = CheatAnalyserState;
 
     fn does_handle(message_type: MessageType) -> bool {
-        let message_types = HANDLED_MESSAGE_TYPES.lock().unwrap();
-        message_types.is_empty() || message_types.contains(&message_type)
+        HANDLED_MESSAGE_MASK.with(|mask| mask.get() & message_type_mask(message_type) != 0)
     }
 
     fn handle_header(&mut self, _header: &tf_demo_parser::demo::header::Header) {
@@ -549,9 +683,23 @@ impl MessageHandler for CheatAnalyser<'_> {
     fn handle_message(&mut self, message: &Message, _tick: DemoTick, parser_state: &ParserState) {
         match message {
             Message::PacketEntities(message) => {
+                let mut resolved_entity_props = HashMap::with_capacity(message.entities.len());
                 for entity in &message.entities {
-                    self.handle_entity(entity, parser_state);
+                    if entity.update_type == UpdateType::Enter {
+                        resolved_entity_props
+                            .insert(entity.entity_index, entity.props(parser_state).collect());
+                    }
                 }
+                for entity in &message.entities {
+                    self.handle_entity(
+                        entity,
+                        parser_state,
+                        resolved_entity_props
+                            .get(&entity.entity_index)
+                            .map(Vec::as_slice),
+                    );
+                }
+                self.state.resolved_entity_props = resolved_entity_props;
             }
             Message::NetTick(_) => {
                 self.check_progress();
@@ -608,8 +756,13 @@ impl MessageHandler for CheatAnalyser<'_> {
             },
             _ => {}
         }
-        for algorithm in &mut self.algorithms {
-            if !algorithm.does_handle(message.get_message_type()) {
+        let message_mask = message_type_mask(message.get_message_type());
+        for (algorithm, handled_mask) in self
+            .algorithms
+            .iter_mut()
+            .zip(self.algorithm_message_masks.iter().copied())
+        {
+            if handled_mask & message_mask == 0 {
                 continue;
             }
             match algorithm.on_message(message, &self.state, &parser_state, _tick) {
@@ -674,37 +827,42 @@ impl crate::base::demo_handler_base::DemoHandlerAnalyser for CheatAnalyser<'_> {
         self.state.user_cmds.push(packet);
     }
 
-    fn handle_console_cmd(&mut self, packet: tf_demo_parser::demo::packet::consolecmd::ConsoleCmdPacket) {
+    fn handle_console_cmd(
+        &mut self,
+        packet: tf_demo_parser::demo::packet::consolecmd::ConsoleCmdPacket,
+    ) {
         self.state.console_cmds.push((packet.tick, packet.command));
     }
 }
 
 impl<'a> CheatAnalyser<'a> {
     pub fn new(algorithms: Vec<Box<dyn CheatAlgorithm<'a> + 'a + Send>>) -> Self {
-        let mut message_types = HANDLED_MESSAGE_TYPES.lock().unwrap();
-        // Figure out what message types we're going to be using.
-        let mut specified_message_types: Vec<MessageType> = vec![];
-        for algorithm in &algorithms {
-            match algorithm.handled_messages() {
-                Ok(types) => specified_message_types.extend(types),
-                Err(true) => {
-                    // An empty HANDLED_MESSAGE_TYPES means we parse ALL messages.
-                    message_types.clear();
-                    break;
-                }
-                Err(false) => {}
-            }
-        }
+        let mut parser_message_mask = BASE_MESSAGE_MASK;
+        let algorithm_message_masks: Vec<u64> = algorithms
+            .iter()
+            .map(|algorithm| {
+                let mask = match algorithm.handled_messages() {
+                    Ok(types) => types.into_iter().fold(0, |mask, message_type| {
+                        mask | message_type_mask(message_type)
+                    }),
+                    Err(true) => u64::MAX,
+                    Err(false) => 0,
+                };
+                parser_message_mask |= mask;
+                mask
+            })
+            .collect();
 
-        if !message_types.is_empty() {
-            message_types.extend(specified_message_types);
-            message_types.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
-            message_types.dedup();
-        }
+        // Parsing and the static callback run on the same worker thread. A
+        // thread-local mask gives concurrent demos their exact message set and
+        // avoids a previously enabled parse-all algorithm permanently widening
+        // every later analysis.
+        HANDLED_MESSAGE_MASK.with(|mask| mask.set(parser_message_mask));
 
         Self {
             state: Default::default(),
             algorithms,
+            algorithm_message_masks,
             detections: Vec::new(),
             header: None,
             tick: DemoTick::default(),
@@ -715,7 +873,10 @@ impl<'a> CheatAnalyser<'a> {
         }
     }
 
-    pub fn handle_user_cmd(&mut self, packet: tf_demo_parser::demo::packet::usercmd::UserCmdPacket) {
+    pub fn handle_user_cmd(
+        &mut self,
+        packet: tf_demo_parser::demo::packet::usercmd::UserCmdPacket,
+    ) {
         self.state.user_cmds.push(packet);
     }
 
@@ -855,7 +1016,11 @@ impl<'a> CheatAnalyser<'a> {
             dev_print!(
                 "Processing tick {} ({} remaining, {:.0} tps)",
                 tick,
-                if total_ticks > tick { total_ticks - tick } else { 0 },
+                if total_ticks > tick {
+                    total_ticks - tick
+                } else {
+                    0
+                },
                 tps
             );
         }
@@ -877,26 +1042,64 @@ impl<'a> CheatAnalyser<'a> {
         }
     }
 
-    pub fn handle_entity(&mut self, entity: &PacketEntity, parser_state: &ParserState) {
+    pub fn handle_entity<'b>(
+        &mut self,
+        entity: &'b PacketEntity,
+        parser_state: &'b ParserState,
+        resolved_enter_props: Option<&'b [SendProp]>,
+    ) {
         let class_name: &str = self
             .class_names
             .get(usize::from(entity.server_class))
             .map(|class_name| class_name.as_str())
             .unwrap_or("");
 
+        let needs_state_props = matches!(
+            class_name,
+            "CTFPlayer"
+                | "CTFPlayerResource"
+                | "CWorld"
+                | "CObjectSentrygun"
+                | "CObjectDispenser"
+                | "CObjectTeleporter"
+        );
+        // Delta updates already own exactly the changed properties, so borrow them directly.
+        // Enter updates also need their class baseline merged in; materialize that merged view
+        // once and share it between weapon tracking and the specialized state handler.
+        let state_props: Option<Cow<'_, [SendProp]>> = needs_state_props.then(|| {
+            if entity.update_type == UpdateType::Enter {
+                resolved_enter_props.map_or_else(
+                    || Cow::Owned(entity.props(parser_state).collect()),
+                    Cow::Borrowed,
+                )
+            } else {
+                Cow::Borrowed(entity.props.as_slice())
+            }
+        });
+
         if entity.update_type == UpdateType::Delete {
             self.state.weapons.remove(&entity.entity_index);
         } else {
-            let mut item_def = None;
-            for prop in entity.props(parser_state) {
-                if let Some((_, prop_name)) = prop.identifier.names() {
-                    if prop_name == "m_iItemDefinitionIndex" {
-                        if let Ok(val) = i64::try_from(&prop.value) {
-                            item_def = Some(val as u16);
-                        }
-                    }
-                }
-            }
+            const ITEM_DEFINITION_INDEX: SendPropIdentifier =
+                SendPropIdentifier::new("DT_ScriptCreatedItem", "m_iItemDefinitionIndex");
+
+            let read_item_definition = |prop: &SendProp| {
+                (prop.identifier == ITEM_DEFINITION_INDEX)
+                    .then(|| i64::try_from(&prop.value).ok().map(|value| value as u16))
+                    .flatten()
+            };
+            let item_def = match state_props.as_deref() {
+                Some(props) => props.iter().find_map(read_item_definition),
+                None if entity.update_type == UpdateType::Enter => resolved_enter_props
+                    .and_then(|props| props.iter().find_map(read_item_definition))
+                    .or_else(|| {
+                        entity
+                            .props(parser_state)
+                            .find_map(|prop| read_item_definition(&prop))
+                    }),
+                None => entity.props.iter().find_map(read_item_definition),
+            };
+
             if item_def.is_some()
                 || class_name.starts_with("CTFWeapon")
                 || class_name.starts_with("CTFShotgun")
@@ -936,35 +1139,28 @@ impl<'a> CheatAnalyser<'a> {
             }
         }
 
+        let props = state_props.as_deref().unwrap_or_default();
         match class_name {
-            "CTFPlayer" => self.handle_player_entity(entity, parser_state),
-            "CTFPlayerResource" => self.handle_player_resource(entity, parser_state),
-            "CWorld" => self.handle_world_entity(entity, parser_state),
-            "CObjectSentrygun" => self.handle_sentry_entity(entity, parser_state),
-            "CObjectDispenser" => self.handle_dispenser_entity(entity, parser_state),
-            "CObjectTeleporter" => self.handle_teleporter_entity(entity, parser_state),
+            "CTFPlayer" => self.handle_player_entity(entity, props),
+            "CTFPlayerResource" => self.handle_player_resource(props),
+            "CWorld" => self.handle_world_entity(props),
+            "CObjectSentrygun" => self.handle_sentry_entity(entity, props),
+            "CObjectDispenser" => self.handle_dispenser_entity(entity, props),
+            "CObjectTeleporter" => self.handle_teleporter_entity(entity, props),
             _ => {}
         }
     }
 
-    pub fn handle_player_resource(&mut self, entity: &PacketEntity, parser_state: &ParserState) {
-        for prop in entity.props(parser_state) {
+    pub fn handle_player_resource(&mut self, props: &[SendProp]) {
+        for prop in props {
             if let Some((table_name, prop_name)) = prop.identifier.names() {
                 if let Ok(player_id) = u32::from_str(prop_name.as_str()) {
                     let entity_id = EntityId::from(player_id);
-                    let mut mappings: Vec<(EntityId, UserId)> = vec![];
-                    if let Some(player) = self
-                        .state
-                        .players
-                        .iter_mut()
-                        .find(|player| player.entity == entity_id)
-                    {
-                        match &player.info {
-                            Some(info) => {
-                                mappings.push((entity_id, info.user_id));
-                            }
-                            None => {}
-                        };
+                    let mut mapping = None;
+                    if let Some(player) = self.state.get_player_by_entity_mut(entity_id) {
+                        if let Some(info) = &player.info {
+                            mapping = Some((entity_id, info.user_id));
+                        }
                         match table_name.as_str() {
                             "m_iTeam" => {
                                 player.team =
@@ -987,7 +1183,7 @@ impl<'a> CheatAnalyser<'a> {
                             _ => {}
                         }
                     }
-                    for (entity_id, user_id) in mappings {
+                    if let Some((entity_id, user_id)) = mapping {
                         self.state.set_entid_to_userid(entity_id, user_id);
                     }
                 }
@@ -995,7 +1191,7 @@ impl<'a> CheatAnalyser<'a> {
         }
     }
 
-    pub fn handle_player_entity(&mut self, entity: &PacketEntity, parser_state: &ParserState) {
+    pub fn handle_player_entity(&mut self, entity: &PacketEntity, props: &[SendProp]) {
         let player = self.state.get_or_create_player(entity.entity_index);
 
         const HEALTH_PROP: SendPropIdentifier =
@@ -1024,53 +1220,61 @@ impl<'a> CheatAnalyser<'a> {
 
         const SIMTIME_PROP: SendPropIdentifier =
             SendPropIdentifier::new("DT_BaseEntity", "m_flSimulationTime");
+        const ACTIVE_WEAPON_PROP: SendPropIdentifier =
+            SendPropIdentifier::new("DT_BaseCombatCharacter", "m_hActiveWeapon");
+        const CONDITION_BITS_PROP: SendPropIdentifier =
+            SendPropIdentifier::new("DT_TFPlayerConditionListExclusive", "_condition_bits");
+        const CONDITION_PROP: SendPropIdentifier =
+            SendPropIdentifier::new("DT_TFPlayerShared", "m_nPlayerCond");
+        const CONDITION_EX_PROP: SendPropIdentifier =
+            SendPropIdentifier::new("DT_TFPlayerShared", "m_nPlayerCondEx");
+        const CONDITION_EX2_PROP: SendPropIdentifier =
+            SendPropIdentifier::new("DT_TFPlayerShared", "m_nPlayerCondEx2");
+        const INVIS_CHANGE_COMPLETE_TIME_PROP: SendPropIdentifier =
+            SendPropIdentifier::new("DT_TFPlayerShared", "m_flInvisChangeCompleteTime");
+        const FLAGS_PROP: SendPropIdentifier = SendPropIdentifier::new("DT_BasePlayer", "m_fFlags");
 
         player.in_pvs = entity.in_pvs;
 
-        for prop in entity.props(parser_state) {
-            if let Some((_, prop_name)) = prop.identifier.names() {
-                match prop_name.as_str() {
-                    "m_hActiveWeapon" => {
-                        if let Ok(val) = i64::try_from(&prop.value) {
-                            let handle = val as u32;
-                            let ent_id = crate::util::helpers::handle_to_entid(handle);
-                            player.active_weapon = if u32::from(ent_id) != 0x7FF && u32::from(ent_id) != 0 {
+        for prop in props {
+            match prop.identifier {
+                ACTIVE_WEAPON_PROP => {
+                    if let Ok(val) = i64::try_from(&prop.value) {
+                        let handle = val as u32;
+                        let ent_id = crate::util::helpers::handle_to_entid(handle);
+                        player.active_weapon =
+                            if u32::from(ent_id) != 0x7FF && u32::from(ent_id) != 0 {
                                 Some(ent_id)
                             } else {
                                 None
                             };
-                        }
                     }
-                    "m_nPlayerCond" | "_condition_bits" => {
-                        if let Ok(val) = i64::try_from(&prop.value) {
-                            player.cond = val as u32;
-                        }
-                    }
-                    "m_nPlayerCondEx" => {
-                        if let Ok(val) = i64::try_from(&prop.value) {
-                            player.cond_ex = val as u32;
-                        }
-                    }
-                    "m_nPlayerCondEx2" => {
-                        if let Ok(val) = i64::try_from(&prop.value) {
-                            player.cond_ex2 = val as u32;
-                        }
-                    }
-                    "m_flInvisChangeCompleteTime" => {
-                        if let Ok(val) = f32::try_from(&prop.value) {
-                            player.invis_change_complete_time = val;
-                        }
-                    }
-                    "m_fFlags" => {
-                        if let Ok(val) = i64::try_from(&prop.value) {
-                            player.flags = val as u32;
-                        }
-                    }
-                    _ => {}
                 }
-            }
-
-            match prop.identifier {
+                CONDITION_PROP | CONDITION_BITS_PROP => {
+                    if let Ok(val) = i64::try_from(&prop.value) {
+                        player.cond = val as u32;
+                    }
+                }
+                CONDITION_EX_PROP => {
+                    if let Ok(val) = i64::try_from(&prop.value) {
+                        player.cond_ex = val as u32;
+                    }
+                }
+                CONDITION_EX2_PROP => {
+                    if let Ok(val) = i64::try_from(&prop.value) {
+                        player.cond_ex2 = val as u32;
+                    }
+                }
+                INVIS_CHANGE_COMPLETE_TIME_PROP => {
+                    if let Ok(val) = f32::try_from(&prop.value) {
+                        player.invis_change_complete_time = val;
+                    }
+                }
+                FLAGS_PROP => {
+                    if let Ok(val) = i64::try_from(&prop.value) {
+                        player.flags = val as u32;
+                    }
+                }
                 HEALTH_PROP => {
                     player.health = i64::try_from(&prop.value).unwrap_or_default() as u16
                 }
@@ -1102,28 +1306,30 @@ impl<'a> CheatAnalyser<'a> {
         }
     }
 
-    pub fn handle_world_entity(&mut self, entity: &PacketEntity, parser_state: &ParserState) {
-        if let (
-            Some(SendProp {
-                value: SendPropValue::Vector(boundary_min),
-                ..
-            }),
-            Some(SendProp {
-                value: SendPropValue::Vector(boundary_max),
-                ..
-            }),
-        ) = (
-            entity.get_prop_by_name("DT_WORLD", "m_WorldMins", parser_state),
-            entity.get_prop_by_name("DT_WORLD", "m_WorldMaxs", parser_state),
-        ) {
+    pub fn handle_world_entity(&mut self, props: &[SendProp]) {
+        const BOUNDARY_MIN: SendPropIdentifier = SendPropIdentifier::new("DT_WORLD", "m_WorldMins");
+        const BOUNDARY_MAX: SendPropIdentifier = SendPropIdentifier::new("DT_WORLD", "m_WorldMaxs");
+
+        let vector_prop = |identifier| {
+            props
+                .iter()
+                .find(|prop| prop.identifier == identifier)
+                .and_then(|prop| match &prop.value {
+                    SendPropValue::Vector(vector) => Some(*vector),
+                    _ => None,
+                })
+        };
+        if let (Some(boundary_min), Some(boundary_max)) =
+            (vector_prop(BOUNDARY_MIN), vector_prop(BOUNDARY_MAX))
+        {
             self.state.world = Some(World {
                 boundary_min,
                 boundary_max,
-            })
+            });
         }
     }
 
-    pub fn handle_sentry_entity(&mut self, entity: &PacketEntity, parser_state: &ParserState) {
+    pub fn handle_sentry_entity(&mut self, entity: &PacketEntity, props: &[SendProp]) {
         const ANGLE: SendPropIdentifier =
             SendPropIdentifier::new("DT_TFNonLocalPlayerExclusive", "m_angEyeAngles[1]");
         const MINI: SendPropIdentifier =
@@ -1142,14 +1348,14 @@ impl<'a> CheatAnalyser<'a> {
             return;
         }
 
-        self.handle_building(entity, parser_state, BuildingClass::Sentry);
+        self.handle_building(entity, props, BuildingClass::Sentry);
 
         let building = self
             .state
             .get_or_create_building(entity.entity_index, BuildingClass::Sentry);
 
         if let Building::Sentry(sentry) = building {
-            for prop in entity.props(parser_state) {
+            for prop in props {
                 match prop.identifier {
                     ANGLE => sentry.angle = f32::try_from(&prop.value).unwrap_or_default(),
                     MINI => sentry.is_mini = i64::try_from(&prop.value).unwrap_or_default() > 0,
@@ -1171,7 +1377,7 @@ impl<'a> CheatAnalyser<'a> {
         }
     }
 
-    pub fn handle_teleporter_entity(&mut self, entity: &PacketEntity, parser_state: &ParserState) {
+    pub fn handle_teleporter_entity(&mut self, entity: &PacketEntity, props: &[SendProp]) {
         const RECHARGE_TIME: SendPropIdentifier =
             SendPropIdentifier::new("DT_ObjectTeleporter", "m_flRechargeTime");
         const RECHARGE_DURATION: SendPropIdentifier =
@@ -1190,14 +1396,14 @@ impl<'a> CheatAnalyser<'a> {
             return;
         }
 
-        self.handle_building(entity, parser_state, BuildingClass::Teleporter);
+        self.handle_building(entity, props, BuildingClass::Teleporter);
 
         let building = self
             .state
             .get_or_create_building(entity.entity_index, BuildingClass::Teleporter);
 
         if let Building::Teleporter(teleporter) = building {
-            for prop in entity.props(parser_state) {
+            for prop in props {
                 match prop.identifier {
                     RECHARGE_TIME => {
                         teleporter.recharge_time = f32::try_from(&prop.value).unwrap_or_default()
@@ -1226,7 +1432,7 @@ impl<'a> CheatAnalyser<'a> {
         }
     }
 
-    pub fn handle_dispenser_entity(&mut self, entity: &PacketEntity, parser_state: &ParserState) {
+    pub fn handle_dispenser_entity(&mut self, entity: &PacketEntity, props: &[SendProp]) {
         const AMMO: SendPropIdentifier =
             SendPropIdentifier::new("DT_ObjectDispenser", "m_iAmmoMetal");
         const HEALING: SendPropIdentifier =
@@ -1237,14 +1443,14 @@ impl<'a> CheatAnalyser<'a> {
             return;
         }
 
-        self.handle_building(entity, parser_state, BuildingClass::Dispenser);
+        self.handle_building(entity, props, BuildingClass::Dispenser);
 
         let building = self
             .state
             .get_or_create_building(entity.entity_index, BuildingClass::Dispenser);
 
         if let Building::Dispenser(dispenser) = building {
-            for prop in entity.props(parser_state) {
+            for prop in props {
                 match prop.identifier {
                     AMMO => dispenser.metal = i64::try_from(&prop.value).unwrap_or_default() as u16,
                     HEALING => {
@@ -1264,12 +1470,7 @@ impl<'a> CheatAnalyser<'a> {
         }
     }
 
-    fn handle_building(
-        &mut self,
-        entity: &PacketEntity,
-        parser_state: &ParserState,
-        class: BuildingClass,
-    ) {
+    fn handle_building(&mut self, entity: &PacketEntity, props: &[SendProp], class: BuildingClass) {
         let building = self
             .state
             .get_or_create_building(entity.entity_index, class);
@@ -1325,7 +1526,7 @@ impl<'a> CheatAnalyser<'a> {
                 health,
                 ..
             }) => {
-                for prop in entity.props(parser_state) {
+                for prop in props {
                     match prop.identifier {
                         LOCAL_ORIGIN => {
                             *position = Vector::try_from(&prop.value).unwrap_or_default()
@@ -1381,7 +1582,14 @@ impl<'a> CheatAnalyser<'a> {
                     .user_info_history
                     .insert(id64, user_info.clone().into());
             }
-            self.state.get_or_create_player(ent_id).info = Some(user_info.into());
+            let player_info: UserInfo = user_info.into();
+            let sid = SteamID::from_steam3(&player_info.steam_id)
+                .map(u64::from)
+                .ok();
+            self.state.get_or_create_player(ent_id).info = Some(player_info);
+            if let Some(sid) = sid {
+                self.state.set_player_steam_id(ent_id, sid);
+            }
         }
 
         Ok(())

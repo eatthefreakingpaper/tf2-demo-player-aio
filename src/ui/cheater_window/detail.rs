@@ -162,8 +162,11 @@ mod tests {
     #[test]
     fn oob_pitch_shows_its_angle() {
         let block = detail_block(&json!({ "pitch": 90.0, "valve_server": true }));
-        assert_eq!(block, "pitch: 90
-valve_server: yes");
+        assert_eq!(
+            block,
+            "pitch: 90
+valve_server: yes"
+        );
     }
 
     #[test]
@@ -176,9 +179,17 @@ valve_server: yes");
             "1_3_delta": 0.0,
             "ratio": 3.4,
         }));
-        for needed in ["1_2_delta: 0.028", "1_3_delta: 0", "ratio: 3.4", "angle_2: 12.528"] {
-            assert!(block.contains(needed), "{needed:?} missing from:
-{block}");
+        for needed in [
+            "1_2_delta: 0.028",
+            "1_3_delta: 0",
+            "ratio: 3.4",
+            "angle_2: 12.528",
+        ] {
+            assert!(
+                block.contains(needed),
+                "{needed:?} missing from:
+{block}"
+            );
         }
     }
 
@@ -196,7 +207,10 @@ valve_server: yes");
     #[test]
     fn arrays_and_pairs_stay_readable() {
         assert_eq!(format_value(&json!([1.5, 2.25])), "[1.5, 2.25]");
-        assert_eq!(format_value(&json!([[1.0, 2.0], [3.0, 4.0]])), "[[1, 2], [3, 4]]");
+        assert_eq!(
+            format_value(&json!([[1.0, 2.0], [3.0, 4.0]])),
+            "[[1, 2], [3, 4]]"
+        );
     }
 
     #[test]
@@ -226,15 +240,23 @@ valve_server: yes");
     #[test]
     fn copy_all_covers_every_flagged_player() {
         let players = vec![
-            (1u64, Some("a".to_string()), vec![detection(10, "x", json!({ "v": 1 }))]),
+            (
+                1u64,
+                Some("a".to_string()),
+                vec![detection(10, "x", json!({ "v": 1 }))],
+            ),
             (2u64, None, vec![detection(20, "y", json!({ "v": 2 }))]),
         ];
         let report = full_report("demo.dem", &players);
-        assert!(report.starts_with("Cheater detection - demo.dem
-2 player(s) flagged"));
+        assert!(report.starts_with(
+            "Cheater detection - demo.dem
+2 player(s) flagged"
+        ));
         assert!(report.contains("1 (a) - 1 detection(s)"));
-        assert!(report.contains("
-2 - 1 detection(s)"));
+        assert!(report.contains(
+            "
+2 - 1 detection(s)"
+        ));
         assert!(report.contains("v: 1") && report.contains("v: 2"));
     }
 
@@ -243,7 +265,11 @@ valve_server: yes");
     fn the_collapsed_summary_stays_short() {
         let data = json!({ "deltas": (0..200).map(|i| i as f64 / 7.0).collect::<Vec<_>>() });
         let line = summary(&data);
-        assert!(line.chars().count() <= 96, "summary was {} chars", line.chars().count());
+        assert!(
+            line.chars().count() <= 96,
+            "summary was {} chars",
+            line.chars().count()
+        );
         // ...while the expanded block keeps everything.
         assert!(detail_block(&data).len() > line.len());
     }
@@ -262,7 +288,10 @@ valve_server: yes");
         assert_eq!(keys, vec!["angle_attacker", "angle_victim", "angle_diff"]);
 
         let block = detail_block(&data);
-        assert!(!block.contains('\u{200b}'), "zero-width space survived into the output");
+        assert!(
+            !block.contains('\u{200b}'),
+            "zero-width space survived into the output"
+        );
         assert!(block.contains("angle_diff: 24.28"));
     }
 }

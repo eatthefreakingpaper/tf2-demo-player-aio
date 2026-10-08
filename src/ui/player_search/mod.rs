@@ -216,10 +216,12 @@ impl PlayerSearchModel {
                 continue;
             };
             for (name, steamid) in players {
-                let building = by_steamid.entry(steamid.clone()).or_insert_with(|| Building {
-                    names: HashSet::new(),
-                    demos: HashSet::new(),
-                });
+                let building = by_steamid
+                    .entry(steamid.clone())
+                    .or_insert_with(|| Building {
+                        names: HashSet::new(),
+                        demos: HashSet::new(),
+                    });
                 building.names.insert(name.clone());
                 building.demos.insert(demo.filename.clone());
             }
@@ -379,7 +381,11 @@ impl FactoryComponent for PlayerRowModel {
                 }
             }
             PlayerRowMsg::CopyDemos => {
-                let display = self.names.first().cloned().unwrap_or_else(|| self.steamid.clone());
+                let display = self
+                    .names
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| self.steamid.clone());
                 let _ = sender.output(PlayerRowOut::CopyDemos(display, self.demos.clone()));
             }
         }

@@ -1,8 +1,15 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use demo_analysis::lib::algorithm::{analyse_multithreaded, apply_config, get_algorithms, Detection};
+use demo_analysis::lib::algorithm::{
+    analyse_multithreaded, apply_config, get_algorithms, Detection,
+};
 use demo_analysis::lib::parameters::Config;
+
+pub struct AnalysisResult {
+    pub detections: Vec<Detection>,
+    pub player_names: HashMap<u64, String>,
+}
 
 pub fn analyse_demo(
     path: std::path::PathBuf,
@@ -10,7 +17,7 @@ pub fn analyse_demo(
     param_overrides: Config,
     threads: usize,
     progress_cb: impl Fn(usize, u32, u32) + Sync,
-) -> Result<Vec<Detection>> {
+) -> Result<AnalysisResult> {
     let file = std::fs::read(&path)?;
 
     let mut algorithms = get_algorithms();
@@ -23,5 +30,16 @@ pub fn analyse_demo(
     apply_config(&mut algorithms, &param_overrides);
 
     let analyser = analyse_multithreaded(&file, algorithms, threads, progress_cb)?;
-    Ok(analyser.detections)
+    let mut player_names = analyser.state.player_names.clone();
+    for (sid, info) in &analyser.state.user_info_history {
+        if !info.name.is_empty() {
+            player_names
+                .entry(*sid)
+                .or_insert_with(|| info.name.clone());
+        }
+    }
+    Ok(AnalysisResult {
+        detections: analyser.detections,
+        player_names,
+    })
 }

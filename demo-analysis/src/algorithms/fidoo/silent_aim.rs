@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use anyhow::Error;
 use serde_json::json;
+#[cfg(test)]
 use steamid_ng::SteamID;
 use tf_demo_parser::demo::vector::Vector;
 use tf_demo_parser::ParserState;
@@ -41,12 +42,65 @@ enum WeaponCategory {
     Excluded,
 }
 
+#[derive(Clone, Copy)]
+struct SilentAimHotParams {
+    tick_window: usize,
+    max_delta_first_third: f32,
+    min_delta_second_third: f32,
+    min_ratio: f32,
+    exact_match_epsilon: f32,
+    suspicion_threshold: u32,
+    min_pvs_ticks: u32,
+    require_fire: bool,
+    fire_sync_ticks: u32,
+    clean_ticks_to_reset: u32,
+}
+
+impl Default for SilentAimHotParams {
+    fn default() -> Self {
+        Self {
+            tick_window: 4,
+            max_delta_first_third: 2.2,
+            min_delta_second_third: 8.0,
+            min_ratio: 4.8,
+            exact_match_epsilon: 0.0001,
+            suspicion_threshold: 2,
+            min_pvs_ticks: 3,
+            require_fire: true,
+            fire_sync_ticks: 5,
+            clean_ticks_to_reset: 2000,
+        }
+    }
+}
+
+impl SilentAimHotParams {
+    fn from_params(params: &Parameters) -> Self {
+        Self {
+            tick_window: get_parameter_value::<i32>(params, "tick_window").max(2) as usize,
+            max_delta_first_third: get_parameter_value(params, "max_delta_first_third"),
+            min_delta_second_third: get_parameter_value(params, "min_delta_second_third"),
+            min_ratio: get_parameter_value(params, "min_ratio"),
+            exact_match_epsilon: get_parameter_value(params, "exact_match_epsilon"),
+            suspicion_threshold: get_parameter_value::<i32>(params, "suspicion_threshold").max(1)
+                as u32,
+            min_pvs_ticks: get_parameter_value::<i32>(params, "min_pvs_ticks").max(1) as u32,
+            require_fire: get_parameter_value(params, "require_fire"),
+            fire_sync_ticks: get_parameter_value::<i32>(params, "fire_sync_ticks").max(1) as u32,
+            clean_ticks_to_reset: get_parameter_value::<i32>(params, "clean_ticks_to_reset").max(1)
+                as u32,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct SilentAim {
     player_states: HashMap<u64, PlayerHistoryState>,
     jg: JankGuard,
     params: Parameters,
     detections: Vec<Detection>,
+    hot_params: SilentAimHotParams,
+    active_sids: Vec<u64>,
+    weapon_categories: HashMap<String, WeaponCategory>,
 }
 
 impl SilentAim {
@@ -73,7 +127,11 @@ impl SilentAim {
         let lw = weapon_name.to_lowercase();
 
         // Sapper (Spy sappers, including builder_spy)
-        if lw.contains("sapper") || lw.contains("ap-sap") || lw.contains("red-tape") || lw.contains("builder_spy") {
+        if lw.contains("sapper")
+            || lw.contains("ap-sap")
+            || lw.contains("red-tape")
+            || lw.contains("builder_spy")
+        {
             return WeaponCategory::Sapper;
         }
 
@@ -296,6 +354,11 @@ impl<'a> CheatAlgorithm<'a> for SilentAim {
         true
     }
 
+    fn init(&mut self) -> Result<(), Error> {
+        self.hot_params = SilentAimHotParams::from_params(&self.params);
+        Ok(())
+    }
+
     fn algorithm_name(&self) -> &str {
         "fidoo/silent_aim"
     }
@@ -336,41 +399,27 @@ impl<'a> CheatAlgorithm<'a> for SilentAim {
     ) -> Result<Vec<Detection>, Error> {
         self.jg.on_tick(state);
         let ticknum = u32::from(state.tick);
-        let algo_name = self.algorithm_name().to_string();
+        let params = self.hot_params;
+        let tick_window = params.tick_window;
+        let max_delta_first_third = params.max_delta_first_third;
+        let min_delta_second_third = params.min_delta_second_third;
+        let min_ratio = params.min_ratio;
+        let exact_match_epsilon = params.exact_match_epsilon;
+        let suspicion_threshold = params.suspicion_threshold;
+        let min_pvs_ticks = params.min_pvs_ticks;
+        let require_fire = params.require_fire;
+        let fire_sync_ticks = params.fire_sync_ticks;
+        let clean_ticks_to_reset = params.clean_ticks_to_reset;
 
-        let tick_window = get_parameter_value::<i32>(&self.params, "tick_window").max(2) as usize;
-        let max_delta_first_third =
-            get_parameter_value::<f32>(&self.params, "max_delta_first_third");
-        let min_delta_second_third =
-            get_parameter_value::<f32>(&self.params, "min_delta_second_third");
-        let min_ratio = get_parameter_value::<f32>(&self.params, "min_ratio");
-        let exact_match_epsilon =
-            get_parameter_value::<f32>(&self.params, "exact_match_epsilon");
-        let suspicion_threshold =
-            get_parameter_value::<i32>(&self.params, "suspicion_threshold").max(1) as u32;
-        let min_pvs_ticks =
-            get_parameter_value::<i32>(&self.params, "min_pvs_ticks").max(1) as u32;
-        let require_fire = get_parameter_value::<bool>(&self.params, "require_fire");
-        let fire_sync_ticks =
-            get_parameter_value::<i32>(&self.params, "fire_sync_ticks").max(1) as u32;
-        let clean_ticks_to_reset =
-            get_parameter_value::<i32>(&self.params, "clean_ticks_to_reset").max(1) as u32;
-
-        let mut current_active_sids = Vec::new();
+        self.active_sids.clear();
         let mut tick_detections = Vec::new();
 
         for player in &state.players {
-            let Some(info) = &player.info else {
-                continue;
-            };
-            if info.steam_id == "BOT" {
-                continue;
-            }
-            let Ok(steam_id) = SteamID::from_steam3(&info.steam_id).map(u64::from) else {
+            let Some(steam_id) = player.steam_id() else {
                 continue;
             };
 
-            current_active_sids.push(steam_id);
+            self.active_sids.push(steam_id);
             let pstate = self.player_states.entry(steam_id).or_default();
 
             // PVS and Life state validation: player must be alive and in PVS
@@ -440,7 +489,15 @@ impl<'a> CheatAlgorithm<'a> for SilentAim {
 
             // Classify weapon
             let weapon_name = state.get_player_weapon(player);
-            let weapon_category = Self::classify_weapon(&weapon_name);
+            let weapon_category = self
+                .weapon_categories
+                .get(weapon_name.as_str())
+                .copied()
+                .unwrap_or_else(|| {
+                    let category = Self::classify_weapon(&weapon_name);
+                    self.weapon_categories.insert(weapon_name.clone(), category);
+                    category
+                });
 
             // Skip excluded non-damaging utility/mobility tools (healing beams, jumper training tools, parachutes)
             if weapon_category == WeaponCategory::Excluded {
@@ -503,7 +560,12 @@ impl<'a> CheatAlgorithm<'a> for SilentAim {
                 }
 
                 // Specifically filter downward rocket jumping (Soldier + Rocket Launcher + pitch > 65°)
-                if Self::is_rocket_jump_context(class_name, &weapon_name, curr_snap.pitch_angle, anchor_snap.pitch_angle) {
+                if Self::is_rocket_jump_context(
+                    class_name,
+                    &weapon_name,
+                    curr_snap.pitch_angle,
+                    anchor_snap.pitch_angle,
+                ) {
                     continue;
                 }
 
@@ -512,7 +574,8 @@ impl<'a> CheatAlgorithm<'a> for SilentAim {
 
                 // Check exact angle match (zero drift or within float quantization epsilon)
                 let is_exact = delta_0_i <= exact_match_epsilon
-                    || (curr_snap.view_angle == anchor_snap.view_angle && curr_snap.pitch_angle == anchor_snap.pitch_angle);
+                    || (curr_snap.view_angle == anchor_snap.view_angle
+                        && curr_snap.pitch_angle == anchor_snap.pitch_angle);
 
                 if !is_exact && delta_0_i > max_delta_first_third {
                     continue;
@@ -531,7 +594,10 @@ impl<'a> CheatAlgorithm<'a> for SilentAim {
                     // Skip extreme engine pitch clamp or console command pitch flips (+lookup; +lookdown)
                     if Self::is_extreme_pitch_clamp(mid_snap.pitch_angle)
                         || Self::is_pitch_command_flip(curr_snap.pitch_angle, mid_snap.pitch_angle)
-                        || Self::is_pitch_command_flip(anchor_snap.pitch_angle, mid_snap.pitch_angle)
+                        || Self::is_pitch_command_flip(
+                            anchor_snap.pitch_angle,
+                            mid_snap.pitch_angle,
+                        )
                     {
                         continue;
                     }
@@ -592,7 +658,7 @@ impl<'a> CheatAlgorithm<'a> for SilentAim {
                     if current_suspicion >= suspicion_threshold {
                         let detection = Detection {
                             tick: ticknum,
-                            algorithm: algo_name.clone(),
+                            algorithm: "fidoo/silent_aim".to_string(),
                             player: steam_id,
                             data: json!({
                                 "class": class_name,
@@ -643,8 +709,9 @@ impl<'a> CheatAlgorithm<'a> for SilentAim {
         }
 
         // Clean up disconnected players
+        let active_sids = &self.active_sids;
         self.player_states
-            .retain(|sid, _| current_active_sids.contains(sid));
+            .retain(|sid, _| active_sids.contains(sid));
 
         Ok(tick_detections)
     }
@@ -675,6 +742,7 @@ mod tests {
         in_pvs: bool,
     ) -> Player {
         Player {
+            steam_id64: None,
             entity: EntityId::from(entity_id),
             position: pos,
             health: 125,
@@ -710,6 +778,7 @@ mod tests {
         let mut algo = SilentAim::new();
         algo.params
             .insert("require_fire".to_string(), Parameter::Bool(false));
+        algo.init().unwrap();
         let mut state = CheatAnalyserState::default();
         let parser_state = test_parser_state();
 
@@ -725,7 +794,11 @@ mod tests {
                 1,
                 1,
                 steam_id_str,
-                Vector { x: 0.0, y: 0.0, z: 0.0 },
+                Vector {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
                 45.0,
                 0.0,
                 true,
@@ -739,7 +812,11 @@ mod tests {
             1,
             1,
             steam_id_str,
-            Vector { x: 0.0, y: 0.0, z: 0.0 },
+            Vector {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
             75.0,
             15.0,
             true,
@@ -752,7 +829,11 @@ mod tests {
             1,
             1,
             steam_id_str,
-            Vector { x: 0.0, y: 0.0, z: 0.0 },
+            Vector {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
             45.0,
             0.0,
             true,
@@ -773,6 +854,7 @@ mod tests {
             .insert("require_fire".to_string(), Parameter::Bool(false));
         algo.params
             .insert("suspicion_threshold".to_string(), Parameter::Int(2));
+        algo.init().unwrap();
         let mut state = CheatAnalyserState::default();
         let parser_state = test_parser_state();
 
@@ -785,7 +867,17 @@ mod tests {
         for t in 100..105 {
             state.tick = t.into();
             state.players = vec![create_test_player(
-                1, 1, steam_id_str, Vector { x: 0.0, y: 0.0, z: 0.0 }, 45.0, 0.0, true,
+                1,
+                1,
+                steam_id_str,
+                Vector {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                45.0,
+                0.0,
+                true,
             )];
             let _ = algo.on_tick(&state, &parser_state);
         }
@@ -793,13 +885,33 @@ mod tests {
         // Flick 1: Peak to 75.0, then snapback to 45.5 (drift = 0.5°)
         state.tick = 105.into();
         state.players = vec![create_test_player(
-            1, 1, steam_id_str, Vector { x: 0.0, y: 0.0, z: 0.0 }, 75.0, 15.0, true,
+            1,
+            1,
+            steam_id_str,
+            Vector {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            75.0,
+            15.0,
+            true,
         )];
         let _ = algo.on_tick(&state, &parser_state);
 
         state.tick = 106.into();
         state.players = vec![create_test_player(
-            1, 1, steam_id_str, Vector { x: 0.0, y: 0.0, z: 0.0 }, 45.5, 0.0, true,
+            1,
+            1,
+            steam_id_str,
+            Vector {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            45.5,
+            0.0,
+            true,
         )];
         let det1 = algo.on_tick(&state, &parser_state).unwrap();
         // 1st drift flick should NOT flag yet because suspicion_threshold = 2
@@ -809,7 +921,17 @@ mod tests {
         for t in 107..110 {
             state.tick = t.into();
             state.players = vec![create_test_player(
-                1, 1, steam_id_str, Vector { x: 0.0, y: 0.0, z: 0.0 }, 45.5, 0.0, true,
+                1,
+                1,
+                steam_id_str,
+                Vector {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                45.5,
+                0.0,
+                true,
             )];
             let _ = algo.on_tick(&state, &parser_state);
         }
@@ -817,13 +939,33 @@ mod tests {
         // Flick 2: Peak to 80.0, then snapback to 45.9 (drift = 0.4°)
         state.tick = 110.into();
         state.players = vec![create_test_player(
-            1, 1, steam_id_str, Vector { x: 0.0, y: 0.0, z: 0.0 }, 80.0, 20.0, true,
+            1,
+            1,
+            steam_id_str,
+            Vector {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            80.0,
+            20.0,
+            true,
         )];
         let _ = algo.on_tick(&state, &parser_state);
 
         state.tick = 111.into();
         state.players = vec![create_test_player(
-            1, 1, steam_id_str, Vector { x: 0.0, y: 0.0, z: 0.0 }, 45.9, 0.0, true,
+            1,
+            1,
+            steam_id_str,
+            Vector {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            45.9,
+            0.0,
+            true,
         )];
         let det2 = algo.on_tick(&state, &parser_state).unwrap();
         // 2nd drift flick reaches threshold -> flags!
@@ -837,6 +979,7 @@ mod tests {
         let mut algo = SilentAim::new();
         algo.params
             .insert("require_fire".to_string(), Parameter::Bool(false));
+        algo.init().unwrap();
         let mut state = CheatAnalyserState::default();
         let parser_state = test_parser_state();
 
@@ -849,7 +992,17 @@ mod tests {
         for t in 100..105 {
             state.tick = t.into();
             state.players = vec![create_test_player(
-                1, 1, steam_id_str, Vector { x: 0.0, y: 0.0, z: 500.0 }, 45.0, 58.0, true,
+                1,
+                1,
+                steam_id_str,
+                Vector {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 500.0,
+                },
+                45.0,
+                58.0,
+                true,
             )];
             let _ = algo.on_tick(&state, &parser_state);
         }
@@ -857,14 +1010,34 @@ mod tests {
         // Flick to (65.0, 60.0) -> peak delta ~ 20°
         state.tick = 105.into();
         state.players = vec![create_test_player(
-            1, 1, steam_id_str, Vector { x: 0.0, y: 0.0, z: 500.0 }, 65.0, 60.0, true,
+            1,
+            1,
+            steam_id_str,
+            Vector {
+                x: 0.0,
+                y: 0.0,
+                z: 500.0,
+            },
+            65.0,
+            60.0,
+            true,
         )];
         let _ = algo.on_tick(&state, &parser_state);
 
         // Snapback to exact (45.0, 58.0)
         state.tick = 106.into();
         state.players = vec![create_test_player(
-            1, 1, steam_id_str, Vector { x: 0.0, y: 0.0, z: 500.0 }, 45.0, 58.0, true,
+            1,
+            1,
+            steam_id_str,
+            Vector {
+                x: 0.0,
+                y: 0.0,
+                z: 500.0,
+            },
+            45.0,
+            58.0,
+            true,
         )];
         let detections = algo.on_tick(&state, &parser_state).unwrap();
 
@@ -876,51 +1049,154 @@ mod tests {
     #[test]
     fn test_damaging_weapons_classification() {
         // Continuous flame stream weapons and miniguns must be Excluded (silent aim impossible / non-existent)
-        assert_eq!(SilentAim::classify_weapon("Flame Thrower"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Degreaser"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Backburner"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("The Phlogistinator"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Rainblower"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Nostromo Napalmer"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Minigun"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Iron Curtain"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Tomislav"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Natascha"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("The Brass Beast"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Huo-Long Heater"), WeaponCategory::Excluded);
+        assert_eq!(
+            SilentAim::classify_weapon("Flame Thrower"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Degreaser"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Backburner"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("The Phlogistinator"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Rainblower"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Nostromo Napalmer"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Minigun"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Iron Curtain"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Tomislav"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Natascha"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("The Brass Beast"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Huo-Long Heater"),
+            WeaponCategory::Excluded
+        );
 
         // Projectile weapons that fire discrete projectiles
-        assert_eq!(SilentAim::classify_weapon("Dragon's Fury"), WeaponCategory::Projectile);
-        assert_eq!(SilentAim::classify_weapon("Rocket Launcher"), WeaponCategory::Projectile);
-        assert_eq!(SilentAim::classify_weapon("Grenade Launcher"), WeaponCategory::Projectile);
-        assert_eq!(SilentAim::classify_weapon("Stickybomb Launcher"), WeaponCategory::Projectile);
+        assert_eq!(
+            SilentAim::classify_weapon("Dragon's Fury"),
+            WeaponCategory::Projectile
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Rocket Launcher"),
+            WeaponCategory::Projectile
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Grenade Launcher"),
+            WeaponCategory::Projectile
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Stickybomb Launcher"),
+            WeaponCategory::Projectile
+        );
 
         // Non-damaging mobility and healing items must be Excluded
-        assert_eq!(SilentAim::classify_weapon("Medi Gun"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("The Kritzkrieg"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("The Quick-Fix"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("The Vaccinator"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Rocket Jumper"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Sticky Jumper"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("The B.A.S.E. Jumper"), WeaponCategory::Excluded);
+        assert_eq!(
+            SilentAim::classify_weapon("Medi Gun"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("The Kritzkrieg"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("The Quick-Fix"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("The Vaccinator"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Rocket Jumper"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Sticky Jumper"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("The B.A.S.E. Jumper"),
+            WeaponCategory::Excluded
+        );
 
         // Engineer building tools and PDAs must be Excluded
-        assert_eq!(SilentAim::classify_weapon("Builder"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Toolbox"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Construction PDA"), WeaponCategory::Excluded);
-        assert_eq!(SilentAim::classify_weapon("Destruction PDA"), WeaponCategory::Excluded);
+        assert_eq!(
+            SilentAim::classify_weapon("Builder"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Toolbox"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Construction PDA"),
+            WeaponCategory::Excluded
+        );
+        assert_eq!(
+            SilentAim::classify_weapon("Destruction PDA"),
+            WeaponCategory::Excluded
+        );
     }
 
     #[test]
     fn test_rocket_jump_pitch_floor() {
         // Soldier with Rocket Launcher aiming downward (> 20.0°) is filtered
-        assert!(SilentAim::is_rocket_jump_context("soldier", "Rocket Launcher", 25.0, 25.0));
-        assert!(SilentAim::is_rocket_jump_context("soldier", "Air Strike", 59.6, 59.6));
-        assert!(SilentAim::is_rocket_jump_context("soldier", "Direct Hit", 29.3, 29.3));
+        assert!(SilentAim::is_rocket_jump_context(
+            "soldier",
+            "Rocket Launcher",
+            25.0,
+            25.0
+        ));
+        assert!(SilentAim::is_rocket_jump_context(
+            "soldier",
+            "Air Strike",
+            59.6,
+            59.6
+        ));
+        assert!(SilentAim::is_rocket_jump_context(
+            "soldier",
+            "Direct Hit",
+            29.3,
+            29.3
+        ));
         // Soldier aiming horizontal (<= 20.0°) is NOT filtered
-        assert!(!SilentAim::is_rocket_jump_context("soldier", "Rocket Launcher", 5.0, 5.0));
+        assert!(!SilentAim::is_rocket_jump_context(
+            "soldier",
+            "Rocket Launcher",
+            5.0,
+            5.0
+        ));
         // Non-soldier or non-rocket weapon aiming downward is NOT filtered
-        assert!(!SilentAim::is_rocket_jump_context("scout", "Pistol", 58.0, 58.0));
+        assert!(!SilentAim::is_rocket_jump_context(
+            "scout", "Pistol", 58.0, 58.0
+        ));
     }
 
     #[test]

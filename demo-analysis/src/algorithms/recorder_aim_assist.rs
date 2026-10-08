@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use anyhow::Error;
 use serde_json::json;
@@ -26,6 +26,59 @@ struct TargetSnapshot {
     position: Vector,
     ducking: bool,
     user_id: Option<UserId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TargetAimPoint {
+    target_entity: u32,
+    target_sid: Option<u64>,
+    target_user_id: Option<UserId>,
+    target_age_ticks: u32,
+    point: &'static str,
+    yaw: f32,
+    pitch: f32,
+    radius_deg: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AimHotParams {
+    min_movement_deg: f32,
+    max_movement_deg: f32,
+    min_efficiency: f32,
+    max_final_error_deg: f32,
+    max_final_target_radii: f32,
+    target_history_ticks: u32,
+    cluster_gap_ticks: u32,
+}
+
+impl Default for AimHotParams {
+    fn default() -> Self {
+        Self {
+            min_movement_deg: 0.05,
+            max_movement_deg: 45.0,
+            min_efficiency: 0.80,
+            max_final_error_deg: 2.0,
+            max_final_target_radii: 2.5,
+            target_history_ticks: 4,
+            cluster_gap_ticks: 8,
+        }
+    }
+}
+
+impl AimHotParams {
+    fn from_params(params: &Parameters) -> Self {
+        Self {
+            min_movement_deg: get_parameter_value::<f32>(params, "min_movement_deg"),
+            max_movement_deg: get_parameter_value::<f32>(params, "max_movement_deg"),
+            min_efficiency: get_parameter_value::<f32>(params, "min_efficiency"),
+            max_final_error_deg: get_parameter_value::<f32>(params, "max_final_error_deg"),
+            max_final_target_radii: get_parameter_value::<f32>(params, "max_final_target_radii"),
+            target_history_ticks: get_parameter_value::<i32>(params, "target_history_ticks")
+                .clamp(0, 16) as u32,
+            cluster_gap_ticks: get_parameter_value::<i32>(params, "cluster_gap_ticks").max(0)
+                as u32,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +141,46 @@ struct HurtEvidence {
     victim_user_id: UserId,
 }
 
+#[derive(Default)]
+struct HurtIndex {
+    by_sid: HashMap<u64, Vec<u32>>,
+    by_user_id: HashMap<u32, Vec<u32>>,
+}
+
+impl HurtIndex {
+    fn new(hurts: &[HurtEvidence]) -> Self {
+        let mut index = Self::default();
+        for hurt in hurts {
+            if let Some(sid) = hurt.victim_sid {
+                index.by_sid.entry(sid).or_default().push(hurt.tick);
+            }
+            index
+                .by_user_id
+                .entry(u32::from(hurt.victim_user_id))
+                .or_default()
+                .push(hurt.tick);
+        }
+        index
+    }
+
+    fn confirmed(&self, event: &AimEvent) -> bool {
+        let start = event.start_tick.saturating_sub(2);
+        let end = event.end_tick.saturating_add(6);
+        let ticks = event
+            .target_sid
+            .and_then(|sid| self.by_sid.get(&sid))
+            .or_else(|| {
+                event
+                    .target_user_id
+                    .and_then(|user_id| self.by_user_id.get(&u32::from(user_id)))
+            });
+        ticks.is_some_and(|ticks| {
+            let first = ticks.partition_point(|tick| *tick < start);
+            ticks.get(first).is_some_and(|tick| *tick <= end)
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct AxisSample {
     count: f32,
@@ -100,6 +193,8 @@ pub struct RecorderAimAssist {
     previous_weapon: Option<String>,
     jank_guard: JankGuard,
     target_history: HashMap<u32, VecDeque<TargetSnapshot>>,
+    target_points: Vec<TargetAimPoint>,
+    hot_params: AimHotParams,
     active_event: Option<AimEvent>,
     events: Vec<AimEvent>,
     hurt_events: Vec<HurtEvidence>,
@@ -124,6 +219,8 @@ impl RecorderAimAssist {
             previous_weapon: None,
             jank_guard: JankGuard::default(),
             target_history: HashMap::new(),
+            target_points: Vec::new(),
+            hot_params: AimHotParams::default(),
             active_event: None,
             events: Vec::new(),
             hurt_events: Vec::new(),
@@ -192,15 +289,12 @@ impl RecorderAimAssist {
     }
 
     fn update_target_history(&mut self, state: &CheatAnalyserState, now: u32) {
-        let mut visible = HashSet::new();
-
         for player in state
             .players
             .iter()
             .filter(|player| player.in_pvs && player.state == PlayerState::Alive)
         {
             let entity = u32::from(player.entity);
-            visible.insert(entity);
             let snapshot = TargetSnapshot {
                 tick: now,
                 position: player.position,
@@ -228,11 +322,10 @@ impl RecorderAimAssist {
             }
         }
 
-        self.target_history.retain(|entity, history| {
-            visible.contains(entity)
-                || history
-                    .front()
-                    .is_some_and(|snapshot| now.saturating_sub(snapshot.tick) <= MAX_HISTORY_TICKS)
+        self.target_history.retain(|_, history| {
+            history
+                .front()
+                .is_some_and(|snapshot| now.saturating_sub(snapshot.tick) <= MAX_HISTORY_TICKS)
         });
     }
 
@@ -251,83 +344,94 @@ impl RecorderAimAssist {
         })
     }
 
-    fn has_target(state: &CheatAnalyserState, recorder: &Player) -> bool {
-        Self::current_targets(state, recorder).next().is_some()
-    }
-
-    fn best_solution(
-        &self,
+    fn rebuild_target_points(
+        &mut self,
         state: &CheatAnalyserState,
         recorder: &Player,
-        previous: RecorderCmd,
-        current: RecorderCmd,
         history_ticks: u32,
-    ) -> Option<AimSolution> {
+    ) {
+        self.target_points.clear();
+
         let mut eye = recorder.position;
         eye.z += if recorder.is_ducking() { 45.0 } else { 64.0 };
-
-        let delta_yaw = signed_angle_delta(current.yaw, previous.yaw);
-        let delta_pitch = current.pitch - previous.pitch;
-        let movement_deg = delta_yaw.hypot(delta_pitch);
-        let mut best: Option<AimSolution> = None;
+        let now = u32::from(state.tick);
 
         for target in Self::current_targets(state, recorder) {
             let entity = u32::from(target.entity);
             let Some(history) = self.target_history.get(&entity) else {
                 continue;
             };
+            let target_sid = player_steam_id(target);
+            let target_user_id = target.info.as_ref().map(|info| info.user_id);
 
-            for snapshot in history.iter().filter(|snapshot| {
-                u32::from(state.tick).saturating_sub(snapshot.tick) <= history_ticks
-            }) {
+            for snapshot in history
+                .iter()
+                .filter(|snapshot| now.saturating_sub(snapshot.tick) <= history_ticks)
+            {
                 for (height, radius, point) in target_points(snapshot.ducking) {
                     let mut point_position = snapshot.position;
                     point_position.z += height;
-                    let Some((target_yaw, target_pitch, distance)) =
-                        aim_angles(eye, point_position)
-                    else {
+                    let Some((yaw, pitch, distance)) = aim_angles(eye, point_position) else {
                         continue;
                     };
-
-                    let before_error_deg =
-                        angular_error(previous.yaw, previous.pitch, target_yaw, target_pitch);
-                    let after_error_deg =
-                        angular_error(current.yaw, current.pitch, target_yaw, target_pitch);
-                    let radius_deg = radius.atan2(distance).to_degrees().max(0.15);
-                    let after_error_radii = after_error_deg / radius_deg;
-                    let efficiency = if movement_deg > f32::EPSILON {
-                        (before_error_deg - after_error_deg) / movement_deg
-                    } else {
-                        0.0
-                    };
-
-                    let solution = AimSolution {
+                    self.target_points.push(TargetAimPoint {
                         target_entity: entity,
-                        target_sid: player_steam_id(target),
-                        target_user_id: target.info.as_ref().map(|info| info.user_id),
-                        target_age_ticks: u32::from(state.tick).saturating_sub(snapshot.tick),
+                        target_sid,
+                        target_user_id,
+                        target_age_ticks: now.saturating_sub(snapshot.tick),
                         point,
-                        before_error_deg,
-                        after_error_deg,
-                        after_error_radii,
-                        movement_deg,
-                        efficiency,
-                        delta_yaw,
-                        delta_pitch,
-                    };
-
-                    if !self.solution_is_candidate(solution) {
-                        continue;
-                    }
-                    let replace = best.as_ref().is_none_or(|old| {
-                        solution.after_error_radii < old.after_error_radii
-                            || (solution.after_error_radii == old.after_error_radii
-                                && solution.after_error_deg < old.after_error_deg)
+                        yaw,
+                        pitch,
+                        radius_deg: radius.atan2(distance).to_degrees().max(0.15),
                     });
-                    if replace {
-                        best = Some(solution);
-                    }
                 }
+            }
+        }
+    }
+
+    fn best_solution(&self, previous: RecorderCmd, current: RecorderCmd) -> Option<AimSolution> {
+        let delta_yaw = signed_angle_delta(current.yaw, previous.yaw);
+        let delta_pitch = current.pitch - previous.pitch;
+        let movement_deg = delta_yaw.hypot(delta_pitch);
+        let mut best: Option<AimSolution> = None;
+
+        for target in &self.target_points {
+            let before_error_deg =
+                angular_error(previous.yaw, previous.pitch, target.yaw, target.pitch);
+            let after_error_deg =
+                angular_error(current.yaw, current.pitch, target.yaw, target.pitch);
+            let after_error_radii = after_error_deg / target.radius_deg;
+            let efficiency = if movement_deg > f32::EPSILON {
+                (before_error_deg - after_error_deg) / movement_deg
+            } else {
+                0.0
+            };
+
+            let solution = AimSolution {
+                target_entity: target.target_entity,
+                target_sid: target.target_sid,
+                target_user_id: target.target_user_id,
+                target_age_ticks: target.target_age_ticks,
+                point: target.point,
+                before_error_deg,
+                after_error_deg,
+                after_error_radii,
+                movement_deg,
+                efficiency,
+                delta_yaw,
+                delta_pitch,
+            };
+
+            if !self.solution_is_candidate(solution) {
+                continue;
+            }
+            let replace = best.as_ref().is_none_or(|old| {
+                solution.after_error_radii < old.after_error_radii
+                    || (solution.after_error_radii == old.after_error_radii
+                        && solution.after_error_deg < old.after_error_deg)
+            });
+            if replace {
+                best = Some(solution);
             }
         }
 
@@ -335,17 +439,11 @@ impl RecorderAimAssist {
     }
 
     fn solution_is_candidate(&self, solution: AimSolution) -> bool {
-        let min_movement = get_parameter_value::<f32>(&self.params, "min_movement_deg");
-        let max_movement = get_parameter_value::<f32>(&self.params, "max_movement_deg");
-        let min_efficiency = get_parameter_value::<f32>(&self.params, "min_efficiency");
-        let max_final_error = get_parameter_value::<f32>(&self.params, "max_final_error_deg");
-        let max_final_radii = get_parameter_value::<f32>(&self.params, "max_final_target_radii");
-
-        solution.movement_deg >= min_movement
-            && solution.movement_deg <= max_movement
-            && solution.efficiency >= min_efficiency
-            && solution.after_error_deg <= max_final_error
-            && solution.after_error_radii <= max_final_radii
+        solution.movement_deg >= self.hot_params.min_movement_deg
+            && solution.movement_deg <= self.hot_params.max_movement_deg
+            && solution.efficiency >= self.hot_params.min_efficiency
+            && solution.after_error_deg <= self.hot_params.max_final_error_deg
+            && solution.after_error_radii <= self.hot_params.max_final_target_radii
             && solution.before_error_deg > solution.after_error_deg + 0.01
     }
 
@@ -386,8 +484,7 @@ impl RecorderAimAssist {
             mouse_dx: current.mouse_dx,
             mouse_dy: current.mouse_dy,
         };
-        let cluster_gap =
-            get_parameter_value::<i32>(&self.params, "cluster_gap_ticks").max(0) as u32;
+        let cluster_gap = self.hot_params.cluster_gap_ticks;
 
         let merge = self.active_event.as_ref().is_some_and(|event| {
             event.target_entity == solution.target_entity
@@ -428,13 +525,7 @@ impl RecorderAimAssist {
         });
     }
 
-    fn process_command(
-        &mut self,
-        state: &CheatAnalyserState,
-        recorder: &Player,
-        weapon_name: &str,
-        current: RecorderCmd,
-    ) {
+    fn process_command(&mut self, recorder: &Player, weapon_name: &str, current: RecorderCmd) {
         let Some(previous) = self.previous_cmd else {
             self.previous_cmd = Some(current);
             return;
@@ -458,32 +549,22 @@ impl RecorderAimAssist {
             return;
         }
 
-        if !Self::has_target(state, recorder) {
+        if self.target_points.is_empty() {
             self.collect_mouse_model(current, delta_yaw, delta_pitch);
             self.previous_cmd = Some(current);
             return;
         }
 
         self.eligible_commands += 1;
-        let history_ticks =
-            get_parameter_value::<i32>(&self.params, "target_history_ticks").clamp(0, 16) as u32;
         let mut recorded_candidate = false;
 
-        if let Some(solution) =
-            self.best_solution(state, recorder, previous, current, history_ticks)
-        {
-            if self.solution_is_candidate(solution) {
-                self.record_candidate(solution, current, recorder, weapon_name.to_string());
-                recorded_candidate = true;
-            } else {
-                let cluster_gap =
-                    get_parameter_value::<i32>(&self.params, "cluster_gap_ticks").max(0) as u32;
-                if self.active_event.as_ref().is_some_and(|event| {
-                    current.demo_tick.saturating_sub(event.end_tick) > cluster_gap
-                }) {
-                    self.flush_active_event();
-                }
-            }
+        if let Some(solution) = self.best_solution(previous, current) {
+            self.record_candidate(solution, current, recorder, weapon_name.to_string());
+            recorded_candidate = true;
+        } else if self.active_event.as_ref().is_some_and(|event| {
+            current.demo_tick.saturating_sub(event.end_tick) > self.hot_params.cluster_gap_ticks
+        }) {
+            self.flush_active_event();
         }
 
         // Candidate corrections are excluded so an aim assist cannot train the
@@ -493,21 +574,16 @@ impl RecorderAimAssist {
         }
         self.previous_cmd = Some(current);
     }
-    fn event_has_confirmed_hit(&self, event: &AimEvent) -> bool {
-        self.hurt_events.iter().any(|hurt| {
-            hurt.tick >= event.start_tick.saturating_sub(2)
-                && hurt.tick <= event.end_tick.saturating_add(6)
-                && match (hurt.victim_sid, event.target_sid) {
-                    (Some(victim), Some(target)) => victim == target,
-                    _ => event.target_user_id == Some(hurt.victim_user_id),
-                }
-        })
-    }
 }
 
 impl<'a> CheatAlgorithm<'a> for RecorderAimAssist {
     fn default(&self) -> bool {
-        true
+        false
+    }
+
+    fn init(&mut self) -> Result<(), Error> {
+        self.hot_params = AimHotParams::from_params(&self.params);
+        Ok(())
     }
 
     fn algorithm_name(&self) -> &str {
@@ -596,18 +672,21 @@ impl<'a> CheatAlgorithm<'a> for RecorderAimAssist {
             self.previous_weapon = Some(weapon_name.clone());
         }
 
+        if !state.user_cmds.is_empty() {
+            self.rebuild_target_points(state, recorder, self.hot_params.target_history_ticks);
+        }
+
         for packet in &state.user_cmds {
             let command = RecorderCmd::from_packet(packet);
             if !command.yaw.is_finite() || !command.pitch.is_finite() {
                 self.reset_motion();
                 continue;
             }
-            self.process_command(state, recorder, &weapon_name, command);
+            self.process_command(recorder, &weapon_name, command);
         }
 
         if self.active_event.as_ref().is_some_and(|event| {
-            now.saturating_sub(event.end_tick)
-                > get_parameter_value::<i32>(&self.params, "cluster_gap_ticks").max(0) as u32
+            now.saturating_sub(event.end_tick) > self.hot_params.cluster_gap_ticks
         }) {
             self.flush_active_event();
         }
@@ -768,11 +847,12 @@ impl<'a> CheatAlgorithm<'a> for RecorderAimAssist {
         } else {
             mismatch_events
         };
+        let hurt_index = HurtIndex::new(&self.hurt_events);
 
         Ok(output_events
             .into_iter()
             .map(|(event, simulation)| {
-                let confirmed_hit = self.event_has_confirmed_hit(event);
+                let confirmed_hit = hurt_index.confirmed(event);
                 let confidence = (0.40 * event.best.efficiency.clamp(0.0, 1.0)
                     + 0.25 * (1.0 - event.best.after_error_radii / 2.5).clamp(0.0, 1.0)
                     + 0.15 * f32::from(event.attack_commands > 0)
@@ -841,29 +921,45 @@ fn max_target_window_evidence(
     events: &[(&AimEvent, SimulationEvidence)],
     window_ticks: u32,
 ) -> (usize, u32, usize) {
+    type TargetKey = (u32, Option<u64>, Option<u32>);
+
+    let mut grouped: HashMap<TargetKey, Vec<(u32, u32)>> = HashMap::new();
+    for (event, evidence) in events {
+        grouped
+            .entry((
+                event.target_entity,
+                event.target_sid,
+                event.target_user_id.map(u32::from),
+            ))
+            .or_default()
+            .push((event.best_tick, evidence.mismatch_steps));
+    }
+
     let mut max_events = 0;
     let mut max_mismatch_steps = 0;
     let mut events_at_max_mismatch_steps = 0;
 
-    for (start, _) in events {
-        let window_end = start.best_tick.saturating_add(window_ticks);
-        let mut event_count = 0;
-        let mut mismatch_steps = 0;
-        for (event, evidence) in events {
-            let same_target = event.target_entity == start.target_entity
-                && event.target_sid == start.target_sid
-                && event.target_user_id == start.target_user_id;
-            if same_target && event.best_tick >= start.best_tick && event.best_tick <= window_end {
-                event_count += 1;
-                mismatch_steps += evidence.mismatch_steps;
+    for target_events in grouped.values_mut() {
+        target_events.sort_unstable_by_key(|(tick, _)| *tick);
+        let mut left = 0;
+        let mut mismatch_steps = 0_u32;
+
+        for right in 0..target_events.len() {
+            mismatch_steps = mismatch_steps.saturating_add(target_events[right].1);
+            while target_events[right].0.saturating_sub(target_events[left].0) > window_ticks {
+                mismatch_steps = mismatch_steps.saturating_sub(target_events[left].1);
+                left += 1;
             }
-        }
-        max_events = max_events.max(event_count);
-        if mismatch_steps > max_mismatch_steps
-            || (mismatch_steps == max_mismatch_steps && event_count > events_at_max_mismatch_steps)
-        {
-            max_mismatch_steps = mismatch_steps;
-            events_at_max_mismatch_steps = event_count;
+
+            let event_count = right - left + 1;
+            max_events = max_events.max(event_count);
+            if mismatch_steps > max_mismatch_steps
+                || (mismatch_steps == max_mismatch_steps
+                    && event_count > events_at_max_mismatch_steps)
+            {
+                max_mismatch_steps = mismatch_steps;
+                events_at_max_mismatch_steps = event_count;
+            }
         }
     }
 

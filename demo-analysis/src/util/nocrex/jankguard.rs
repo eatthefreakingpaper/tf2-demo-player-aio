@@ -2,8 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::base::cheat_analyser_base::{CheatAnalyserState, Player, PlayerState};
-use steamid_ng::SteamID;
+use crate::base::cheat_analyser_base::{CheatAnalyserState, PlayerState};
 use tf_demo_parser::demo::sendprop::SendPropIdentifier;
 
 const TELEPORT_DIST: f32 = 256.0;
@@ -14,7 +13,8 @@ struct PlayerData {
     pub last_teleport: u32,
     pub last_fire: u32,
 
-    pub prev_state: Option<Player>,
+    pub prev_position: Option<tf_demo_parser::demo::vector::Vector>,
+    pub seen_this_tick: bool,
 }
 
 #[derive(Default)]
@@ -24,10 +24,11 @@ pub struct JankGuard {
 
 impl JankGuard {
     pub fn teleported(&self, player: &u64, tick: u32) -> u32 {
-        tick.saturating_sub(self
-            .player_data
-            .get(player)
-            .map_or(0, |pd| pd.last_teleport))
+        tick.saturating_sub(
+            self.player_data
+                .get(player)
+                .map_or(0, |pd| pd.last_teleport),
+        )
     }
 
     pub fn spawned(&self, player: &u64, tick: u32) -> u32 {
@@ -95,7 +96,7 @@ impl JankGuard {
                             if let Some(id64) = i64::try_from(&prop.value)
                                 .ok()
                                 .and_then(|id| id.try_into().ok())
-                                .map(|id|crate::util::helpers::handle_to_entid(id))
+                                .map(|id| crate::util::helpers::handle_to_entid(id))
                                 .and_then(|id| state.entid_to_userid.get(&id))
                                 .and_then(|uid| state.userid_to_id64.get(uid))
                             {
@@ -110,34 +111,35 @@ impl JankGuard {
     }
 
     pub fn on_tick(&mut self, state: &CheatAnalyserState) {
-        let mut states = HashMap::new();
-        for player in state.players.iter().filter(|p| {
-            p.in_pvs
-                && p.state == PlayerState::Alive
-                && p.info.as_ref().is_some_and(|info| info.steam_id != "BOT")
-        }) {
-            let info = match &player.info {
-                Some(info) => info,
-                None => continue,
+        for player_data in self.player_data.values_mut() {
+            player_data.seen_this_tick = false;
+        }
+
+        for player in state
+            .players
+            .iter()
+            .filter(|player| player.in_pvs && player.state == PlayerState::Alive)
+        {
+            let Some(steam_id) = player.steam_id() else {
+                continue;
             };
 
-            let steam_id: u64 = u64::from(SteamID::from_steam3(&info.steam_id).unwrap());
-
             let player_data = self.player_data.entry(steam_id).or_default();
-            let prev_player = player_data.prev_state.as_ref();
-
-            if prev_player.as_ref().is_some_and(|p| {
-                // Ignore players that just moved more than 256 HUs in a single tick (teleport)
-                let diff = p.position - player.position;
+            if player_data.prev_position.is_some_and(|previous| {
+                let diff = previous - player.position;
                 let sq_len = diff.x.powi(2) + diff.y.powi(2) + diff.z.powi(2);
                 sq_len > TELEPORT_DIST.powi(2)
             }) {
                 player_data.last_teleport = state.tick.into();
             }
-            states.insert(steam_id, player.clone());
+            player_data.prev_position = Some(player.position);
+            player_data.seen_this_tick = true;
         }
-        for (steam_id, player_data) in self.player_data.iter_mut() {
-            player_data.prev_state = states.remove(&steam_id);
+
+        for player_data in self.player_data.values_mut() {
+            if !player_data.seen_this_tick {
+                player_data.prev_position = None;
+            }
         }
     }
 }

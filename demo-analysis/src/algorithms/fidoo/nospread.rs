@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use anyhow::Error;
 use serde_json::json;
-use steamid_ng::SteamID;
 use tf_demo_parser::demo::message::packetentities::EntityId;
 use tf_demo_parser::demo::message::Message;
 use tf_demo_parser::demo::sendprop::SendPropIdentifier;
@@ -22,7 +21,11 @@ struct WeaponSpreadInfo {
     max_cone_degrees: f32,
 }
 
-fn get_weapon_spread_info(weapon_id: Option<u32>, weapon_name: &str, class_name: &str) -> Option<WeaponSpreadInfo> {
+fn get_weapon_spread_info(
+    weapon_id: Option<u32>,
+    weapon_name: &str,
+    class_name: &str,
+) -> Option<WeaponSpreadInfo> {
     if let Some(id) = weapon_id {
         match id {
             18 => {
@@ -261,12 +264,8 @@ fn resolve_player_sid(player_raw: u32, state: &CheatAnalyserState) -> Option<u64
                 return Some(*sid);
             }
         }
-        if let Some(player) = state.players.iter().find(|p| p.entity == ent_id) {
-            if let Some(info) = &player.info {
-                if let Ok(sid) = SteamID::from_steam3(&info.steam_id) {
-                    return Some(u64::from(sid));
-                }
-            }
+        if let Some(sid) = state.steam_id_for_entity(ent_id) {
+            return Some(sid);
         }
     }
     None
@@ -394,7 +393,10 @@ impl NoSpread {
                 ("min_seed_correlation".to_string(), Parameter::Float(-0.85)),
                 ("min_variance_ratio".to_string(), Parameter::Float(4.5)),
                 ("max_tracking_variance".to_string(), Parameter::Float(0.50)),
-                ("spread_tolerance_margin".to_string(), Parameter::Float(0.50)),
+                (
+                    "spread_tolerance_margin".to_string(),
+                    Parameter::Float(0.50),
+                ),
                 ("min_detections".to_string(), Parameter::Int(3)),
             ]),
             jg: JankGuard::default(),
@@ -481,10 +483,12 @@ impl<'a> CheatAlgorithm<'a> for NoSpread {
                     if let Some(player_raw) = player_opt {
                         if let Some(sid) = resolve_player_sid(player_raw, state) {
                             let current_tick: u32 = tick.into();
-                            self.fire_events
-                                .entry(sid)
-                                .or_default()
-                                .push((current_tick, seed_opt, spread_opt, weapon_opt));
+                            self.fire_events.entry(sid).or_default().push((
+                                current_tick,
+                                seed_opt,
+                                spread_opt,
+                                weapon_opt,
+                            ));
                         }
                     }
                 }
@@ -514,14 +518,8 @@ impl<'a> CheatAlgorithm<'a> for NoSpread {
                 && p.state == PlayerState::Alive
                 && p.info.as_ref().is_some_and(|info| info.steam_id != "BOT")
         }) {
-            let info = match &player.info {
-                Some(info) => info,
-                None => continue,
-            };
-
-            let steam_id: u64 = match SteamID::from_steam3(&info.steam_id) {
-                Ok(sid) => u64::from(sid),
-                Err(_) => continue,
+            let Some(steam_id) = player.steam_id() else {
+                continue;
             };
 
             let ticks_since_event = self
@@ -534,14 +532,16 @@ impl<'a> CheatAlgorithm<'a> for NoSpread {
                     self.detections
                         .retain(|det| det.player != steam_id || (ticknum - det.tick) > 60);
                 }
-                self.prev_players.insert(steam_id, (player.pitch_angle, player.view_angle, ticknum));
+                self.prev_players
+                    .insert(steam_id, (player.pitch_angle, player.view_angle, ticknum));
                 continue;
             }
 
             let prev_angles = match self.prev_players.get(&steam_id) {
                 Some(&p) => p,
                 None => {
-                    self.prev_players.insert(steam_id, (player.pitch_angle, player.view_angle, ticknum));
+                    self.prev_players
+                        .insert(steam_id, (player.pitch_angle, player.view_angle, ticknum));
                     continue;
                 }
             };
@@ -560,7 +560,8 @@ impl<'a> CheatAlgorithm<'a> for NoSpread {
                     .insert(ticknum, (pa_delta, va_delta));
             }
 
-            self.prev_players.insert(steam_id, (player.pitch_angle, player.view_angle, ticknum));
+            self.prev_players
+                .insert(steam_id, (player.pitch_angle, player.view_angle, ticknum));
 
             // Process bullet fire events for this player
             if let Some(events) = self.fire_events.get(&steam_id) {
@@ -569,7 +570,8 @@ impl<'a> CheatAlgorithm<'a> for NoSpread {
                     if ticknum >= f_tick && ticknum <= f_tick + 2 {
                         let weapon_name = state.get_player_weapon(player);
                         let class_name = player.class_name();
-                        let weapon_info = get_weapon_spread_info(weapon_id, &weapon_name, class_name);
+                        let weapon_info =
+                            get_weapon_spread_info(weapon_id, &weapon_name, class_name);
 
                         let tracker = self.player_trackers.entry(steam_id).or_default();
                         tracker.current_weapon = weapon_info;
@@ -577,16 +579,24 @@ impl<'a> CheatAlgorithm<'a> for NoSpread {
                         if let Some(deltas) = self.player_tick_deltas.get(&steam_id) {
                             // Check single-tick flick and return reversal at f_tick or f_tick+1
                             for t in f_tick..=f_tick + 1 {
-                                if let (Some(&(dp1, dy1)), Some(&(dp2, dy2))) = (deltas.get(&t), deltas.get(&(t + 1))) {
+                                if let (Some(&(dp1, dy1)), Some(&(dp2, dy2))) =
+                                    (deltas.get(&t), deltas.get(&(t + 1)))
+                                {
                                     let mag1 = (dp1 * dp1 + dy1 * dy1).sqrt();
                                     let mag2 = (dp2 * dp2 + dy2 * dy2).sqrt();
 
                                     let dot = dp1 * dp2 + dy1 * dy2;
-                                    let sum_mag = ((dp1 + dp2).powi(2) + (dy1 + dy2).powi(2)).sqrt();
+                                    let sum_mag =
+                                        ((dp1 + dp2).powi(2) + (dy1 + dy2).powi(2)).sqrt();
 
-                                    let max_cone = weapon_info.map_or(2.5, |w| w.max_cone_degrees) + spread_tolerance_margin;
+                                    let max_cone = weapon_info.map_or(2.5, |w| w.max_cone_degrees)
+                                        + spread_tolerance_margin;
 
-                                    if mag1 >= 0.70 && mag2 >= 0.70 && mag1 <= max_cone * 2.0 && dot < 0.0 {
+                                    if mag1 >= 0.70
+                                        && mag2 >= 0.70
+                                        && mag1 <= max_cone * 2.0
+                                        && dot < 0.0
+                                    {
                                         let cos_angle = dot / (mag1 * mag2);
                                         let cancel_ratio = sum_mag / mag1.max(mag2);
 
@@ -597,7 +607,12 @@ impl<'a> CheatAlgorithm<'a> for NoSpread {
                                                 magnitude: mag1,
                                             });
 
-                                            tracker.shot_samples.push((t, (dy1, dp1), seed, spread));
+                                            tracker.shot_samples.push((
+                                                t,
+                                                (dy1, dp1),
+                                                seed,
+                                                spread,
+                                            ));
 
                                             let recent_count = tracker
                                                 .reversals
@@ -613,15 +628,17 @@ impl<'a> CheatAlgorithm<'a> for NoSpread {
                                                 .sum::<f32>()
                                                 / recent_count.max(1) as f32;
 
-                                            let should_flag = recent_count >= 3 && ticknum >= tracker.last_flag_tick + 60;
+                                            let should_flag = recent_count >= 3
+                                                && ticknum >= tracker.last_flag_tick + 60;
                                             if should_flag {
                                                 tracker.last_flag_tick = ticknum;
-                                                let winfo = weapon_info.unwrap_or(WeaponSpreadInfo {
-                                                    category_id: weapon_id.unwrap_or(0),
-                                                    name: "SpreadWeapon",
-                                                    spread_factor: 0.030,
-                                                    max_cone_degrees: 1.72,
-                                                });
+                                                let winfo =
+                                                    weapon_info.unwrap_or(WeaponSpreadInfo {
+                                                        category_id: weapon_id.unwrap_or(0),
+                                                        name: "SpreadWeapon",
+                                                        spread_factor: 0.030,
+                                                        max_cone_degrees: 1.72,
+                                                    });
 
                                                 self.detections.push(Detection {
                                                     tick: ticknum,
@@ -639,7 +656,12 @@ impl<'a> CheatAlgorithm<'a> for NoSpread {
                                             }
 
                                             // Check Method A deterministic seed correlation
-                                            if let Some(det) = tracker.check_seed_correlation(steam_id, ticknum, min_shots, min_seed_correlation) {
+                                            if let Some(det) = tracker.check_seed_correlation(
+                                                steam_id,
+                                                ticknum,
+                                                min_shots,
+                                                min_seed_correlation,
+                                            ) {
                                                 self.detections.push(det);
                                             }
                                         }

@@ -513,8 +513,7 @@ impl AsyncComponent for DemoPlayerModel {
                 if let Some(name) = &opt_name {
                     demo = self.demo_manager.lock().unwrap().get_demo(name).cloned();
                     if reselected {
-                        self.demo_list
-                            .emit(DemoListMsg::SelectByName(name.clone()));
+                        self.demo_list.emit(DemoListMsg::SelectByName(name.clone()));
                     }
                 }
                 self.demo_details
@@ -569,7 +568,11 @@ impl AsyncComponent for DemoPlayerModel {
             DemoPlayerMsg::DeleteSelected => {
                 let selected = self.demo_list.model().get_selected_demos();
                 if util::delete_dialog(root, selected.len()).await {
-                    self.demo_manager.lock().unwrap().delete_demos(selected).await;
+                    self.demo_manager
+                        .lock()
+                        .unwrap()
+                        .delete_demos(selected)
+                        .await;
                     sender.input(DemoPlayerMsg::DemosChanged(false));
                 }
             }
@@ -621,11 +624,7 @@ impl AsyncComponent for DemoPlayerModel {
             }
             DemoPlayerMsg::CopyDemosToFolder(display_name, demo_names) => 'copy_demos: {
                 let Some(base) = self.settings.borrow().demo_folder_path.clone() else {
-                    util::notice_dialog(
-                        root,
-                        "No demo folder set",
-                        "Open a demo folder first.",
-                    );
+                    util::notice_dialog(root, "No demo folder set", "Open a demo folder first.");
                     break 'copy_demos;
                 };
 

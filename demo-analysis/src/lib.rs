@@ -15,6 +15,8 @@ pub mod algorithms {
     pub mod triggerbot;
     pub mod firewindow;
     pub mod recorder_aim_assist;
+    pub mod recorder_command_manipulation;
+    pub mod crit_hack;
     pub mod nocrex {
         pub mod aimsnap;
         pub mod angle_repeat;
@@ -22,7 +24,7 @@ pub mod algorithms {
     }
     pub mod fidoo {
         pub mod silent_aim;
-        pub mod psilent4;
+        pub mod psilent5;
         pub mod nospread;
         pub mod auto_backstab;
         pub mod bunnyhop;

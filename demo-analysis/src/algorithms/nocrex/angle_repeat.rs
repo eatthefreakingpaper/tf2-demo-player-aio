@@ -1,25 +1,45 @@
 // Written by Nocrex, Patched for Command Batching by Ciam
 
-use std::collections::HashMap;
-
-use crate::{
-    base::cheat_analyser_base::{CheatAnalyserState, Player, PlayerState}, util::{helpers::viewangle_delta, nocrex::jankguard::JankGuard}
-};
-
-use crate::lib::algorithm::{CheatAlgorithm, Detection};
-use crate::lib::parameters::{Parameter, Parameters, get_parameter_value};
+use std::collections::{HashMap, VecDeque};
 
 use anyhow::Error;
 use serde_json::json;
-use steamid_ng::SteamID;
 use tf_demo_parser::ParserState;
+
+use crate::base::cheat_analyser_base::{CheatAnalyserState, PlayerState};
+use crate::lib::algorithm::{CheatAlgorithm, Detection};
+use crate::lib::parameters::{get_parameter_value, Parameter, Parameters};
+use crate::util::{helpers::viewangle_delta, nocrex::jankguard::JankGuard};
+
+#[derive(Clone, Copy)]
+struct AngleSnapshot {
+    yaw: f32,
+    pitch: f32,
+}
+
+#[derive(Clone, Copy)]
+struct AngleRepeatParams {
+    min_angle_diff_ratio: f32,
+    min_first_second_angle_delta: f32,
+    max_first_third_angle_delta: f32,
+}
+
+impl Default for AngleRepeatParams {
+    fn default() -> Self {
+        Self {
+            min_angle_diff_ratio: 0.0,
+            min_first_second_angle_delta: 8.0,
+            max_first_third_angle_delta: 1.5,
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct AngleRepeat {
-    ticks: Vec<(u32, HashMap<u64, Player>)>,
-
+    ticks: VecDeque<(u32, HashMap<u64, AngleSnapshot>)>,
     jg: JankGuard,
     params: Parameters,
+    hot_params: AngleRepeatParams,
     detections: Vec<Detection>,
 }
 
@@ -28,17 +48,49 @@ impl AngleRepeat {
         Self {
             params: HashMap::from([
                 ("min_angle_diff_ratio".to_string(), Parameter::Float(0.0)),
-                ("min_first_second_angle_delta".to_string(), Parameter::Float(8.0)),
-                ("max_first_third_angle_delta".to_string(), Parameter::Float(1.5)),
+                (
+                    "min_first_second_angle_delta".to_string(),
+                    Parameter::Float(8.0),
+                ),
+                (
+                    "max_first_third_angle_delta".to_string(),
+                    Parameter::Float(1.5),
+                ),
             ]),
             ..Default::default()
         }
     }
+
+    fn begin_tick(&mut self, tick: u32) {
+        let mut current = if self.ticks.len() >= 3 {
+            self.ticks.pop_back().unwrap_or_default()
+        } else {
+            (0, HashMap::new())
+        };
+        current.0 = tick;
+        current.1.clear();
+        self.ticks.push_front(current);
+    }
 }
 
-impl<'a> CheatAlgorithm<'a> for AngleRepeat {
+impl CheatAlgorithm<'_> for AngleRepeat {
     fn default(&self) -> bool {
         true
+    }
+
+    fn init(&mut self) -> Result<(), Error> {
+        self.hot_params = AngleRepeatParams {
+            min_angle_diff_ratio: get_parameter_value(&self.params, "min_angle_diff_ratio"),
+            min_first_second_angle_delta: get_parameter_value(
+                &self.params,
+                "min_first_second_angle_delta",
+            ),
+            max_first_third_angle_delta: get_parameter_value(
+                &self.params,
+                "max_first_third_angle_delta",
+            ),
+        };
+        Ok(())
     }
 
     fn algorithm_name(&self) -> &str {
@@ -52,94 +104,91 @@ impl<'a> CheatAlgorithm<'a> for AngleRepeat {
     ) -> Result<Vec<Detection>, Error> {
         self.jg.on_tick(state);
         let ticknum = u32::from(state.tick);
-        let players = &state.players;
+        self.begin_tick(ticknum);
 
-        self.ticks.insert(0, (ticknum, HashMap::new()));
-        self.ticks.truncate(3);
-        
-        let min_angle_diff_ratio: f32 = get_parameter_value(&self.params, "min_angle_diff_ratio");
-        let min_first_second_angle_delta: f32 = get_parameter_value(&self.params, "min_first_second_angle_delta");
-        let max_first_third_angle_delta: f32 = get_parameter_value(&self.params, "max_first_third_angle_delta");
-
-        for player in players.iter().filter(|p| {
-            p.in_pvs
-                && p.state == PlayerState::Alive
-                && p.info.as_ref().is_some_and(|info| info.steam_id != "BOT")
-        }) {
-            let info = match &player.info {
-                Some(info) => info,
-                None => continue,
+        for player in state
+            .players
+            .iter()
+            .filter(|player| player.in_pvs && player.state == PlayerState::Alive)
+        {
+            let Some(steam_id) = player.steam_id() else {
+                continue;
             };
 
-            let steam_id: u64 = u64::from(SteamID::from_steam3(&info.steam_id).unwrap());
-
-            let prev_data = self.ticks.get(1).and_then(|(t, m)| m.get(&steam_id).map(|p| (*t, p.clone())));
-            let second_prev_data = self.ticks.get(2).and_then(|(t, m)| m.get(&steam_id).map(|p| (*t, p.clone())));
+            let previous = self
+                .ticks
+                .get(1)
+                .and_then(|(tick, players)| players.get(&steam_id).map(|player| (*tick, *player)));
+            let first = self
+                .ticks
+                .get(2)
+                .and_then(|(tick, players)| players.get(&steam_id).map(|player| (*tick, *player)));
 
             let ticks_since_event = self
                 .jg
                 .teleported(&steam_id, ticknum)
                 .min(self.jg.spawned(&steam_id, ticknum));
-
             if ticks_since_event < 60 {
-                // Ignore detections +-60 ticks from a teleport or spawn event
                 if ticks_since_event == 0 {
-                    self.detections
-                        .retain(|det| det.player != steam_id || (ticknum - det.tick) > 60);
+                    self.detections.retain(|detection| {
+                        detection.player != steam_id || ticknum - detection.tick > 60
+                    });
                 }
                 continue;
             }
 
-            let third_angle = (player.view_angle, player.pitch_angle);
-            self.ticks
-                .get_mut(0)
-                .unwrap()
-                .1
-                .insert(steam_id.clone(), player.clone()); // Store angle for this tick for next ticks
+            let current = AngleSnapshot {
+                yaw: player.view_angle,
+                pitch: player.pitch_angle,
+            };
+            self.ticks.front_mut().unwrap().1.insert(steam_id, current);
 
-            if let (Some((second_t, second_data)), Some((first_t, first_data))) = (prev_data, second_prev_data) {
-                let first_angle = (first_data.view_angle, first_data.pitch_angle);
-                let second_angle = (second_data.view_angle, second_data.pitch_angle);
+            let (Some((second_tick, second)), Some((first_tick, first))) = (previous, first) else {
+                continue;
+            };
+            let first_angle = (first.yaw, first.pitch);
+            let second_angle = (second.yaw, second.pitch);
+            let current_angle = (current.yaw, current.pitch);
 
-                let calc_real_delta = |t_old: u32, a_old: (f32, f32), t_new: u32, a_new: (f32, f32)| -> f32 {
-                    let tick_delta = t_new.saturating_sub(t_old);
-                    
-                    let (va_real, pa_real) = viewangle_delta(a_new.0, a_new.1, a_old.0, a_old.1, tick_delta);
-                    
-                    (va_real * va_real + pa_real * pa_real).sqrt()
+            let real_delta =
+                |old_tick: u32, old_angle: (f32, f32), new_tick: u32, new_angle: (f32, f32)| {
+                    let tick_delta = new_tick.saturating_sub(old_tick);
+                    let (yaw, pitch) = viewangle_delta(
+                        new_angle.0,
+                        new_angle.1,
+                        old_angle.0,
+                        old_angle.1,
+                        tick_delta,
+                    );
+                    (yaw * yaw + pitch * pitch).sqrt()
                 };
+            let first_second_delta = real_delta(first_tick, first_angle, second_tick, second_angle);
+            if first_second_delta < self.hot_params.min_first_second_angle_delta {
+                continue;
+            }
+            let first_third_delta = real_delta(first_tick, first_angle, ticknum, current_angle);
+            let ratio = first_second_delta / first_third_delta.max(1.0);
 
-                let first_second_delta = calc_real_delta(first_t, first_angle, second_t, second_angle);
-                let first_third_delta = calc_real_delta(first_t, first_angle, ticknum, third_angle);
-
-                if first_second_delta < min_first_second_angle_delta {
-                    // Ignore players with only a tiny adjustment in second angle
-                    continue;
-                }
-
-                let ratio = first_second_delta / first_third_delta.max(1.0);
-
-                if first_third_delta <= max_first_third_angle_delta
-                    && ratio > min_angle_diff_ratio
-                    && self.jg.fired(&steam_id, ticknum) < 3
-                {
-                    let (class_name, weapon_name) = state.get_player_class_and_weapon_by_sid(steam_id);
-                    self.detections.push(Detection {
-                        tick: ticknum,
-                        algorithm: self.algorithm_name().to_string(),
-                        player: steam_id,
-                        data: json!({
-                            "class": class_name,
-                            "weapon": weapon_name,
-                            "angle_1": first_angle,
-                            "angle_2": second_angle,
-                            "angle_3": third_angle,
-                            "1_3_delta": first_third_delta,
-                            "1_2_delta": first_second_delta,
-                            "ratio": ratio,
-                        }),
-                    });
-                }
+            if first_third_delta <= self.hot_params.max_first_third_angle_delta
+                && ratio > self.hot_params.min_angle_diff_ratio
+                && self.jg.fired(&steam_id, ticknum) < 3
+            {
+                let (class_name, weapon_name) = state.get_player_class_and_weapon_by_sid(steam_id);
+                self.detections.push(Detection {
+                    tick: ticknum,
+                    algorithm: "nocrex/angle_repeat".to_string(),
+                    player: steam_id,
+                    data: json!({
+                        "class": class_name,
+                        "weapon": weapon_name,
+                        "angle_1": first_angle,
+                        "angle_2": second_angle,
+                        "angle_3": current_angle,
+                        "1_3_delta": first_third_delta,
+                        "1_2_delta": first_second_delta,
+                        "ratio": ratio,
+                    }),
+                });
             }
         }
         Ok(vec![])

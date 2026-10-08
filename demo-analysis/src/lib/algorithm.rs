@@ -1,41 +1,44 @@
 // Import algorithm struct here.
 pub use crate::algorithms::{
     all_messages::AllMessages,
+    angle_history::AngleHistory,
+    backtrack::BackTrack,
+    crit_hack::CritHack,
+    double_tap::DoubleTap,
+    fidoo::{
+        auto_backstab::AutoBackstab, bunnyhop::BunnyHop, invalid_equip_region::InvalidEquipRegion,
+        nospread::NoSpread, psilent5::Psilent5, silent_aim::SilentAim,
+    },
+    firewindow::FireWindow,
+    nocrex::{aimsnap::AimSnap, angle_repeat::AngleRepeat, oob_pitch::OOBPitch},
+    recorder_aim_assist::RecorderAimAssist,
+    recorder_command_manipulation::RecorderCommandManipulation,
+    triggerbot::TriggerBot,
     viewangles_180degrees::ViewAngles180Degrees,
     viewangles_to_csv::ViewAnglesToCSV,
     write_to_file::WriteToFile,
-    angle_history::AngleHistory,
-    backtrack::BackTrack,
-    double_tap::DoubleTap,
-    triggerbot::TriggerBot,
-    firewindow::FireWindow,
-    recorder_aim_assist::RecorderAimAssist,
-    nocrex:: {
-        aimsnap::AimSnap,
-        angle_repeat::AngleRepeat,
-        oob_pitch::OOBPitch,
-    },
-    fidoo::{
-        silent_aim::SilentAim,
-        psilent4::Psilent4,
-        nospread::NoSpread,
-        auto_backstab::AutoBackstab,
-        bunnyhop::BunnyHop,
-        invalid_equip_region::InvalidEquipRegion,
-    }
 };
 
+use crate::{
+    base::cheat_analyser_base::CheatAnalyserState,
+    lib::parameters::{Config, Parameters},
+};
 use anyhow::Error;
-use crate::{base::cheat_analyser_base::CheatAnalyserState, lib::parameters::{Config, Parameters}};
 use bitbuffer::BitRead;
-use serde_json::Value;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use tf_demo_parser::{demo::{data::DemoTick, header::Header, message::Message, parser::RawPacketStream}, MessageType};
+use tf_demo_parser::{
+    demo::{data::DemoTick, header::Header, message::Message, parser::RawPacketStream},
+    MessageType,
+};
 
 pub use tf_demo_parser::{Demo, DemoParser, Parse, ParseError, ParserState, Stream};
 
-use crate::{base::{cheat_analyser_base::CheatAnalyser, demo_handler_base::CheatDemoHandler}, dev_print};
+use crate::{
+    base::{cheat_analyser_base::CheatAnalyser, demo_handler_base::CheatDemoHandler},
+    dev_print,
+};
 
 pub fn get_algorithms() -> Vec<Box<dyn CheatAlgorithm<'static> + Send>> {
     vec![
@@ -52,8 +55,10 @@ pub fn get_algorithms() -> Vec<Box<dyn CheatAlgorithm<'static> + Send>> {
         Box::new(TriggerBot::new()),
         Box::new(FireWindow::new()),
         Box::new(RecorderAimAssist::new()),
+        Box::new(RecorderCommandManipulation::new()),
+        Box::new(CritHack::new()),
         Box::new(SilentAim::new()),
-        Box::new(Psilent4::new()),
+        Box::new(Psilent5::new()),
         Box::new(NoSpread::new()),
         Box::new(AutoBackstab::new()),
         Box::new(BunnyHop::new()),
@@ -159,16 +164,21 @@ pub fn analyse<'a>(
     algorithms: Vec<Box<dyn CheatAlgorithm<'a> + Send>>,
     mut progress_cb: impl FnMut(u32, u32),
 ) -> anyhow::Result<CheatAnalyser<'a>> {
+    const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(75);
+
     let mut stream = demo.get_stream();
     let header: Header = Header::read(&mut stream)?;
     let total_ticks = header.ticks;
     let mut packets = RawPacketStream::new(stream);
+    let mut last_progress = std::time::Instant::now();
+    let mut last_tick = 0;
 
     let analyser = CheatAnalyser::new(algorithms);
     let mut handler = CheatDemoHandler::with_analyser(analyser);
 
     handler.handle_header(&header);
     let _ = handler.analyser.init();
+    progress_cb(0, total_ticks);
     loop {
         let packet = packets.next(&handler.state_handler);
         let packet = match packet {
@@ -181,9 +191,14 @@ pub fn analyse<'a>(
                 continue;
             }
         };
-        progress_cb(packet.tick().into(), total_ticks);
+        last_tick = packet.tick().into();
+        if last_progress.elapsed() >= PROGRESS_INTERVAL {
+            progress_cb(last_tick, total_ticks);
+            last_progress = std::time::Instant::now();
+        }
         let _ = handler.handle_packet(packet)?;
     }
+    progress_cb(last_tick, total_ticks);
     let _ = handler.analyser.finish()?;
     Ok(handler.analyser)
 }
@@ -202,7 +217,9 @@ pub fn analyse_multithreaded<'a>(
     let threads = threads.max(1).min(algorithms.len().max(1));
     if threads <= 1 {
         let demo = Demo::new(demo_bytes);
-        return analyse(&demo, algorithms, |current, total| progress_cb(0, current, total));
+        return analyse(&demo, algorithms, |current, total| {
+            progress_cb(0, current, total)
+        });
     }
 
     let mut chunks: Vec<Vec<Box<dyn CheatAlgorithm<'a> + Send>>> =
@@ -220,7 +237,9 @@ pub fn analyse_multithreaded<'a>(
                 let progress_cb = &progress_cb;
                 scope.spawn(move || {
                     let demo = Demo::new(demo_bytes);
-                    analyse(&demo, chunk, |current, total| progress_cb(i, current, total))
+                    analyse(&demo, chunk, |current, total| {
+                        progress_cb(i, current, total)
+                    })
                 })
             })
             .collect();
@@ -250,10 +269,13 @@ pub trait CheatAlgorithm<'a> {
     }
 
     fn algorithm_name(&self) -> &str {
-        panic!("algorithm_name() not implemented for {}", std::any::type_name::<Self>());
+        panic!(
+            "algorithm_name() not implemented for {}",
+            std::any::type_name::<Self>()
+        );
     }
 
-    fn params(&mut self) -> Option<&mut Parameters>{
+    fn params(&mut self) -> Option<&mut Parameters> {
         None
     }
 
@@ -273,7 +295,11 @@ pub trait CheatAlgorithm<'a> {
     // Called for each tick. Passes the basic game state for the tick
     // Try the write_to_file algorithm to see what those states look like (there is one state per line)
     // cargo run -- -i demo.dem -a write_to_file
-    fn on_tick(&mut self, _state: &CheatAnalyserState, _parser_state: &ParserState) -> Result<Vec<Detection>, Error> {
+    fn on_tick(
+        &mut self,
+        _state: &CheatAnalyserState,
+        _parser_state: &ParserState,
+    ) -> Result<Vec<Detection>, Error> {
         Ok(vec![])
     }
 
@@ -285,7 +311,13 @@ pub trait CheatAlgorithm<'a> {
 
     // Called for each message received by the parser.
     // Only called for types specified in handled_messages.
-    fn on_message(&mut self, _message: &Message, _state: &CheatAnalyserState, _parser_state: &ParserState, _tick: DemoTick) -> Result<Vec<Detection>, Error> {
+    fn on_message(
+        &mut self,
+        _message: &Message,
+        _state: &CheatAnalyserState,
+        _parser_state: &ParserState,
+        _tick: DemoTick,
+    ) -> Result<Vec<Detection>, Error> {
         Ok(vec![])
     }
 
@@ -301,7 +333,7 @@ pub struct Detection {
     pub tick: u32,
     pub algorithm: String,
     pub player: u64,
-    pub data: Value
+    pub data: Value,
 }
 
 #[cfg(test)]
@@ -423,7 +455,10 @@ mod tests {
 
         let config = config_of(algorithm_name, param_name, Parameter::Float(123.5));
         let effective = effective_config(&config);
-        assert_eq!(effective[algorithm_name][param_name], Parameter::Float(123.5));
+        assert_eq!(
+            effective[algorithm_name][param_name],
+            Parameter::Float(123.5)
+        );
         // Untouched parameters survive.
         assert_eq!(effective.len(), defaults.len());
         for (name, params) in &defaults {

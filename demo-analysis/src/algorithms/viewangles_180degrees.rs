@@ -1,116 +1,162 @@
+use std::collections::HashMap;
+
 use anyhow::Error;
 use serde_json::json;
+#[cfg(test)]
 use steamid_ng::SteamID;
 use tf_demo_parser::ParserState;
-use crate::{base::cheat_analyser_base::{CheatAnalyserState, PlayerState}, util::helpers::viewangle_delta};
 
+use crate::base::cheat_analyser_base::{CheatAnalyserState, Player, PlayerState};
 use crate::lib::algorithm::{CheatAlgorithm, Detection};
+use crate::util::helpers::viewangle_delta;
 
-// This example file looks for any examples of players rotating 180 degrees within a single server tick.
-
-// To start, define a struct containing any information you want to store/share between events.
-// Here we want to track the view angle and pitch angle of each player on the previous tick.
-// Later we will compare the previous and current view angles to see if they are 180 degrees apart.
-pub struct ViewAngles180Degrees {
-    previous: Option<CheatAnalyserState>,
+#[derive(Clone, Copy)]
+struct PreviousAngles {
+    view: f32,
+    pitch: f32,
 }
 
-// Then implement a pub fn new for your struct.
-// Use the new() function to initalize any variables specified in the struct.
-// IMPORTANT: new() gets called even if the algorithm is not selected! Don't do any non-ephemeral operations here; use CheatAlgorithm::init() instead.
-// Additional helper functions and consts also go here.
+pub struct ViewAngles180Degrees {
+    previous: HashMap<u64, PreviousAngles>,
+    current: HashMap<u64, PreviousAngles>,
+    previous_tick: u32,
+    has_previous_tick: bool,
+}
 
 impl ViewAngles180Degrees {
     pub fn new() -> Self {
-        let analyser: ViewAngles180Degrees = ViewAngles180Degrees { 
-            previous: None,
-        };
-        analyser
+        Self {
+            previous: HashMap::new(),
+            current: HashMap::new(),
+            previous_tick: 0,
+            has_previous_tick: false,
+        }
+    }
+
+    fn player_id(_state: &CheatAnalyserState, player: &Player) -> Option<u64> {
+        player.steam_id()
     }
 }
 
-// Implement the CheatAlgorithm trait. This is where the bulk of your algorithm resides.
-// Any interesting detections should be documented in a Detection object and returned within a vector.
-// You can attach whatever json data you want to each detection via the "data" field.
-// You don't have to implement every function in CheatAlgorithm; see its definition for a complete list of functions.
-
-impl<'a> CheatAlgorithm<'a> for ViewAngles180Degrees {
-    // REQUIRED: Should this algorithm run by default if -a isn't specified?
-    // Generally should be true, unless you're doing dev-only stuff (writing to files, printing debug output, etc).
+impl CheatAlgorithm<'_> for ViewAngles180Degrees {
     fn default(&self) -> bool {
         true
     }
 
-    // REQUIRED: Set your algorithm's name here. Best practice is to match the filename.
     fn algorithm_name(&self) -> &str {
         "viewangles_180degrees"
     }
 
-    fn on_tick(&mut self, state: &CheatAnalyserState, _: &ParserState) -> Result<Vec<Detection>, Error> {
-        let ticknum = u32::from(state.tick);
-        let players = &state.players;
-
+    fn on_tick(
+        &mut self,
+        state: &CheatAnalyserState,
+        _: &ParserState,
+    ) -> Result<Vec<Detection>, Error> {
+        let tick = u32::from(state.tick);
+        let tick_delta = if tick == 0 || !self.has_previous_tick {
+            0
+        } else {
+            tick.saturating_sub(self.previous_tick)
+        };
         let mut detections = Vec::new();
+        self.current.clear();
+        self.current.reserve(state.players.len());
 
-        // In the vast majority of cases you will only want to iterate over players that are:
-        // - In PVS (data is being sent to the client)
-        // - Alive (you can't cheat if you're dead)
-        // - Not a tf_bot (you can't convict a tf_bot)
-        for player in players.iter().filter(|p| {
-            p.in_pvs && p.state == PlayerState::Alive && p.info.as_ref().is_some_and(|info| info.steam_id != "BOT")
+        for player in state.players.iter().filter(|player| {
+            player.in_pvs
+                && player.state == PlayerState::Alive
+                && player
+                    .info
+                    .as_ref()
+                    .is_some_and(|info| info.steam_id != "BOT")
         }) {
-            let info = match &player.info {
-                Some(info) => info,
-                None => {continue}
+            let Some(player_id) = Self::player_id(state, player) else {
+                continue;
             };
 
-            let steam_id = &info.steam_id;
-            let tick_delta = {
-                if ticknum == 0 {
-                    0
-                } else {
-                    ticknum - self.previous.as_ref().map_or(0, |pstate| pstate.tick.into())
+            if let Some(previous) = self.previous.get(&player_id) {
+                let (view_delta, pitch_delta) = viewangle_delta(
+                    player.view_angle,
+                    player.pitch_angle,
+                    previous.view,
+                    previous.pitch,
+                    tick_delta,
+                );
+                if view_delta.abs() >= 180.0 || pitch_delta.abs() >= 180.0 {
+                    detections.push(Detection {
+                        tick,
+                        algorithm: self.algorithm_name().to_string(),
+                        player: player_id,
+                        data: json!({
+                            "class": player.class_name(),
+                            "weapon": state.get_player_weapon(player),
+                            "va_delta": view_delta,
+                            "pa_delta": pitch_delta,
+                        }),
+                    });
                 }
-            };
-
-            let (va_delta, pa_delta) = self.previous.as_ref()
-                .map_or((f32::NAN, f32::NAN), |prev_state| {
-                    match prev_state.players.iter().find(|p| {
-                        p.in_pvs && p.state == PlayerState::Alive &&
-                        p.info.as_ref().is_some_and(|i| i.steam_id == *steam_id)
-                    }) {
-                        Some(prev_player) => {
-                            let prev_viewangle = prev_player.view_angle;
-                            let prev_pitchangle = prev_player.pitch_angle;
-                            viewangle_delta(player.view_angle, player.pitch_angle, prev_viewangle, prev_pitchangle, tick_delta)
-                        },
-                        None => (f32::NAN, f32::NAN)
-                    }
-                });
-            // Creating the detection object
-            // Avoid creating multiple detection objects for the same player and tick.
-            // Nothing will break if you do, but it will overrepresent the data point.
-            if va_delta.abs() >= 180.0 || pa_delta.abs() >= 180.0 {
-                let class_name = player.class_name();
-                let weapon_name = state.get_player_weapon(player);
-                detections.push(Detection {
-                    tick: ticknum,
-                    algorithm: self.algorithm_name().to_string(),
-                    player: u64::from(SteamID::from_steam3(&steam_id).unwrap()),
-                    data: json!({
-                        "class": class_name,
-                        "weapon": weapon_name,
-                        "va_delta": va_delta,
-                        "pa_delta": pa_delta
-                    })
-                });
             }
+
+            self.current.insert(
+                player_id,
+                PreviousAngles {
+                    view: player.view_angle,
+                    pitch: player.pitch_angle,
+                },
+            );
         }
-        self.previous = Some(state.clone());
-        // Any detections returned are official and final!
-        // If you don't want to return any detections, just return an empty vector.
-        // If your algorithm needs future ticks, you can store the detections within your algorithm's struct.
-        // You can then return them in a later CheatAlgorithm::on_tick() or in CheatAlgorithm::finish().
+
+        std::mem::swap(&mut self.previous, &mut self.current);
+        self.previous_tick = tick;
+        self.has_previous_tick = true;
         Ok(detections)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tf_demo_parser::demo::data::DemoTick;
+    use tf_demo_parser::demo::message::packetentities::EntityId;
+    use tf_demo_parser::demo::parser::analyser::{Class, Team, UserId, UserInfo};
+
+    #[test]
+    fn detects_a_half_turn_between_consecutive_ticks() {
+        let entity = EntityId::from(2u32);
+        let user_id = UserId::from(3u16);
+        let steam_id = u64::from(SteamID::from_steam3("[U:1:12345678]").unwrap());
+        let mut state = CheatAnalyserState::default();
+        state.players.push(Player {
+            entity,
+            class: Class::Scout,
+            team: Team::Red,
+            state: PlayerState::Alive,
+            in_pvs: true,
+            info: Some(UserInfo {
+                classes: Default::default(),
+                name: "ScoutMain".to_string(),
+                user_id,
+                steam_id: "[U:1:12345678]".to_string(),
+                entity_id: entity,
+                team: Team::Red,
+            }),
+            ..Player::default()
+        });
+        state.set_entid_to_userid(entity, user_id);
+        state.set_userid_to_id64(user_id, steam_id);
+
+        let parser_state = ParserState::new(24, |_| true, false);
+        let mut algorithm = ViewAngles180Degrees::new();
+
+        state.tick = DemoTick::from(100u32);
+        assert!(algorithm.on_tick(&state, &parser_state).unwrap().is_empty());
+
+        state.tick = DemoTick::from(101u32);
+        state.players[0].view_angle = 180.0;
+        let detections = algorithm.on_tick(&state, &parser_state).unwrap();
+
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].player, steam_id);
+        assert_eq!(detections[0].tick, 101);
     }
 }

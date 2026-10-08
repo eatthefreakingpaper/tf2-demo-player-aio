@@ -1,7 +1,6 @@
-use std::collections::{HashMap, HashSet};
 use anyhow::Error;
 use serde_json::json;
-use steamid_ng::SteamID;
+use std::collections::{HashMap, HashSet};
 use tf_demo_parser::demo::data::DemoTick;
 use tf_demo_parser::demo::gameevent_gen::GameEvent;
 use tf_demo_parser::demo::message::packetentities::{EntityId, UpdateType};
@@ -14,7 +13,7 @@ use crate::lib::algorithm::{CheatAlgorithm, Detection};
 use crate::lib::parameters::{get_parameter_value, Parameter, Parameters};
 use crate::util::schema_equip_regions::{
     check_cosmetic_conflict, get_cosmetic_info, is_action_item, is_dummy_or_invalid,
-    is_weapon_wearable, CosmeticInfo,
+    is_weapon_wearable,
 };
 
 #[derive(Debug, Clone)]
@@ -28,6 +27,126 @@ struct WearableEntityState {
     spawn_generation: u32,
 }
 
+#[derive(Clone, Copy)]
+struct InvalidEquipHotParams {
+    min_persistence_ticks: u32,
+    check_cosmetic_limit: bool,
+    ignore_quickswitch: bool,
+    valve_servers_only: bool,
+    ignore_preset_swap: bool,
+}
+
+impl Default for InvalidEquipHotParams {
+    fn default() -> Self {
+        Self {
+            min_persistence_ticks: 600,
+            check_cosmetic_limit: true,
+            ignore_quickswitch: true,
+            valve_servers_only: true,
+            ignore_preset_swap: true,
+        }
+    }
+}
+
+impl InvalidEquipHotParams {
+    fn from_params(params: &Parameters) -> Self {
+        Self {
+            min_persistence_ticks: get_parameter_value::<i32>(params, "min_persistence_ticks")
+                .max(1) as u32,
+            check_cosmetic_limit: get_parameter_value(params, "check_cosmetic_limit"),
+            ignore_quickswitch: get_parameter_value(params, "ignore_quickswitch"),
+            valve_servers_only: get_parameter_value(params, "valve_servers_only"),
+            ignore_preset_swap: get_parameter_value(params, "ignore_preset_swap"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CachedLoadout {
+    valid: bool,
+    wearable_revision: u64,
+    generation: u32,
+    account_id: u32,
+    item_ids: Vec<u16>,
+    conflicting_regions: Vec<&'static str>,
+    has_conflict: bool,
+    exceeds_limit: bool,
+    preset_swap_candidate: bool,
+}
+
+fn evaluate_loadout(
+    wearables: &HashMap<EntityId, WearableEntityState>,
+    owner: EntityId,
+    generation: u32,
+    account_id: u32,
+    wearable_revision: u64,
+    check_cosmetic_limit: bool,
+    ignore_quickswitch: bool,
+) -> CachedLoadout {
+    let mut item_ids: Vec<u16> = wearables
+        .values()
+        .filter(|wearable| {
+            wearable.owner == owner
+                && wearable.spawn_generation == generation
+                && !wearable.nodraw
+                && !wearable.is_disguise
+                && (wearable.account_id == 0 || wearable.account_id == account_id)
+                && !is_dummy_or_invalid(wearable.item_def_index)
+                && !is_weapon_wearable(wearable.item_def_index)
+                && !is_action_item(wearable.item_def_index)
+                && get_cosmetic_info(wearable.item_def_index).is_some()
+        })
+        .map(|wearable| wearable.item_def_index)
+        .collect();
+    item_ids.sort_unstable();
+    item_ids.dedup();
+
+    let mut conflicting_regions = Vec::new();
+    let mut has_conflict = false;
+    for i in 0..item_ids.len() {
+        for j in (i + 1)..item_ids.len() {
+            let (Some(info_a), Some(info_b)) = (
+                get_cosmetic_info(item_ids[i]),
+                get_cosmetic_info(item_ids[j]),
+            ) else {
+                continue;
+            };
+            if let Some(conflicts) = check_cosmetic_conflict(info_a, info_b, ignore_quickswitch) {
+                has_conflict = true;
+                conflicting_regions.extend(conflicts);
+            }
+        }
+    }
+    conflicting_regions.sort_unstable();
+    conflicting_regions.dedup();
+
+    let hat_cosmetics_count = item_ids
+        .iter()
+        .filter(|item_id| {
+            get_cosmetic_info(**item_id)
+                .is_some_and(|info| info.regions.iter().any(|region| region == "hat"))
+        })
+        .count();
+    let exceeds_limit = check_cosmetic_limit && item_ids.len() > 3;
+    let preset_swap_candidate = has_conflict
+        && item_ids.len() <= 3
+        && conflicting_regions.len() == 1
+        && conflicting_regions.contains(&"hat")
+        && hat_cosmetics_count == 2;
+
+    CachedLoadout {
+        valid: true,
+        wearable_revision,
+        generation,
+        account_id,
+        item_ids,
+        conflicting_regions,
+        has_conflict,
+        exceeds_limit,
+        preset_swap_candidate,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct PlayerGenerationState {
     generation: u32,
@@ -36,6 +155,7 @@ struct PlayerGenerationState {
     post_reset_conflict_ticks: u32,
     witnessed_in_pvs_reset: bool,
     reported_loadouts: HashSet<Vec<u16>>,
+    cached_loadout: CachedLoadout,
 }
 
 pub struct InvalidEquipRegion {
@@ -44,6 +164,8 @@ pub struct InvalidEquipRegion {
     players: HashMap<EntityId, PlayerGenerationState>,
     current_tick: u32,
     pub server_name: String,
+    wearables_revision: u64,
+    hot_params: InvalidEquipHotParams,
 }
 
 impl Default for InvalidEquipRegion {
@@ -66,6 +188,8 @@ impl InvalidEquipRegion {
             players: HashMap::new(),
             current_tick: 0,
             server_name: String::new(),
+            wearables_revision: 0,
+            hot_params: InvalidEquipHotParams::default(),
         }
     }
 
@@ -81,6 +205,11 @@ impl InvalidEquipRegion {
 impl<'a> CheatAlgorithm<'a> for InvalidEquipRegion {
     fn default(&self) -> bool {
         true
+    }
+
+    fn init(&mut self) -> Result<(), Error> {
+        self.hot_params = InvalidEquipHotParams::from_params(&self.params);
+        Ok(())
     }
 
     fn algorithm_name(&self) -> &str {
@@ -127,6 +256,7 @@ impl<'a> CheatAlgorithm<'a> for InvalidEquipRegion {
                 GameEvent::RoundStart(_) | GameEvent::TeamPlayRoundStart(_) => {
                     self.wearables.clear();
                     self.players.clear();
+                    self.wearables_revision = self.wearables_revision.wrapping_add(1);
                 }
                 GameEvent::PlayerDeath(death) => {
                     let victim_uid = u32::from(death.user_id);
@@ -167,19 +297,22 @@ impl<'a> CheatAlgorithm<'a> for InvalidEquipRegion {
             },
             Message::PacketEntities(msg) => {
                 for removed in &msg.removed_entities {
-                    self.wearables.remove(removed);
+                    if self.wearables.remove(removed).is_some() {
+                        self.wearables_revision = self.wearables_revision.wrapping_add(1);
+                    }
                 }
 
                 for entity in &msg.entities {
                     let class_name = pstate
                         .server_classes
-                        .iter()
-                        .find(|c| c.id == entity.server_class)
+                        .get(usize::from(entity.server_class))
                         .map(|c| c.name.as_str())
                         .unwrap_or("");
 
                     if entity.update_type == UpdateType::Delete {
-                        self.wearables.remove(&entity.entity_index);
+                        if self.wearables.remove(&entity.entity_index).is_some() {
+                            self.wearables_revision = self.wearables_revision.wrapping_add(1);
+                        }
                         continue;
                     }
 
@@ -190,7 +323,7 @@ impl<'a> CheatAlgorithm<'a> for InvalidEquipRegion {
                         let mut nodraw_prop = None;
                         let mut account_id_prop = None;
 
-                        for prop in entity.props(pstate) {
+                        for prop in state.entity_props(entity, pstate).iter() {
                             if let Some((_table, name)) = prop.identifier.names() {
                                 match name.as_str() {
                                     "m_hOwnerEntity" | "m_hOwner" => {
@@ -221,7 +354,8 @@ impl<'a> CheatAlgorithm<'a> for InvalidEquipRegion {
                                     }
                                     "m_fEffects" => {
                                         if let Ok(val) = i64::try_from(&prop.value) {
-                                            nodraw_prop = Some((val & 32) != 0); // EF_NODRAW
+                                            nodraw_prop = Some((val & 32) != 0);
+                                            // EF_NODRAW
                                         }
                                     }
                                     _ => {}
@@ -230,8 +364,10 @@ impl<'a> CheatAlgorithm<'a> for InvalidEquipRegion {
                         }
 
                         let tick_u32 = self.current_tick;
-                        let w = self.wearables.entry(entity.entity_index).or_insert_with(|| {
-                            WearableEntityState {
+                        let w = self
+                            .wearables
+                            .entry(entity.entity_index)
+                            .or_insert_with(|| WearableEntityState {
                                 owner: EntityId::from(0u32),
                                 item_def_index: 0,
                                 account_id: 0,
@@ -239,8 +375,7 @@ impl<'a> CheatAlgorithm<'a> for InvalidEquipRegion {
                                 nodraw: false,
                                 last_seen_tick: tick_u32,
                                 spawn_generation: 0,
-                            }
-                        });
+                            });
 
                         if let Some(owner) = owner_ent {
                             if u32::from(owner) == 0 {
@@ -266,23 +401,15 @@ impl<'a> CheatAlgorithm<'a> for InvalidEquipRegion {
                             w.nodraw = nd;
                         }
                         w.last_seen_tick = tick_u32;
+                        self.wearables_revision = self.wearables_revision.wrapping_add(1);
                     }
                 }
             }
             Message::NetTick(_) => {
-                let min_persistence_ticks =
-                    get_parameter_value::<i32>(&self.params, "min_persistence_ticks").max(1) as u32;
-                let check_cosmetic_limit =
-                    get_parameter_value::<bool>(&self.params, "check_cosmetic_limit");
-                let ignore_quickswitch =
-                    get_parameter_value::<bool>(&self.params, "ignore_quickswitch");
-                let valve_servers_only =
-                    get_parameter_value::<bool>(&self.params, "valve_servers_only");
-                let ignore_preset_swap =
-                    get_parameter_value::<bool>(&self.params, "ignore_preset_swap");
+                let params = self.hot_params;
                 let is_valve_server = self.server_name.contains("Valve Matchmaking Server");
 
-                if valve_servers_only && !is_valve_server {
+                if params.valve_servers_only && !is_valve_server {
                     return Ok(vec![]);
                 }
 
@@ -293,91 +420,44 @@ impl<'a> CheatAlgorithm<'a> for InvalidEquipRegion {
                         continue;
                     }
 
-                    let steam_id64 = match &player.info {
-                        Some(info) => {
-                            if info.steam_id == "BOT" {
-                                continue;
-                            }
-                            SteamID::from_steam3(&info.steam_id)
-                                .map(u64::from)
-                                .unwrap_or(0)
-                        }
-                        None => continue,
+                    let Some(steam_id64) = player.steam_id() else {
+                        continue;
                     };
 
-                    if steam_id64 == 0 {
-                        continue;
-                    }
-
+                    let player_account_id = (steam_id64 & 0xFFFFFFFF) as u32;
                     let p_state = self.players.entry(player.entity).or_default();
 
-                    // If player changed class, advance generation to invalidate previous class wearables
-                    if p_state.current_class != Class::Other && p_state.current_class != player.class {
+                    // A class transition starts a fresh wearable generation.
+                    if p_state.current_class != Class::Other
+                        && p_state.current_class != player.class
+                    {
                         p_state.generation += 1;
                         p_state.conflict_ticks = 0;
                         p_state.post_reset_conflict_ticks = 0;
                         p_state.witnessed_in_pvs_reset = player.in_pvs;
                     }
                     p_state.current_class = player.class;
+                    let target_generation = p_state.generation;
 
-                    let target_gen = p_state.generation;
-
-                    let player_account_id = (steam_id64 & 0xFFFFFFFF) as u32;
-
-                    // Collect active cosmetic wearables for current spawn generation
-                    let mut active_cosmetic_map: HashMap<u16, CosmeticInfo> = HashMap::new();
-                    for w in self.wearables.values() {
-                        if w.owner == player.entity
-                            && w.spawn_generation == target_gen
-                            && !w.nodraw
-                            && !w.is_disguise
-                            && (w.account_id == 0 || w.account_id == player_account_id)
-                            && !is_dummy_or_invalid(w.item_def_index)
-                            && !is_weapon_wearable(w.item_def_index)
-                            && !is_action_item(w.item_def_index)
-                        {
-                            if let Some(info) = get_cosmetic_info(w.item_def_index) {
-                                active_cosmetic_map.insert(w.item_def_index, info);
-                            }
-                        }
+                    let cache_stale = !p_state.cached_loadout.valid
+                        || p_state.cached_loadout.wearable_revision != self.wearables_revision
+                        || p_state.cached_loadout.generation != target_generation
+                        || p_state.cached_loadout.account_id != player_account_id;
+                    if cache_stale {
+                        p_state.cached_loadout = evaluate_loadout(
+                            &self.wearables,
+                            player.entity,
+                            target_generation,
+                            player_account_id,
+                            self.wearables_revision,
+                            params.check_cosmetic_limit,
+                            params.ignore_quickswitch,
+                        );
                     }
 
-                    let mut active_items: Vec<(u16, CosmeticInfo)> =
-                        active_cosmetic_map.into_iter().collect();
-                    active_items.sort_by_key(|(id, _)| *id);
-                    let loadout_key: Vec<u16> = active_items.iter().map(|(id, _)| *id).collect();
-
-                    let mut has_conflict = false;
-                    let mut conflicting_region_names: HashSet<&'static str> = HashSet::new();
-
-                    // Check pairwise region conflicts
-                    for i in 0..active_items.len() {
-                        for j in (i + 1)..active_items.len() {
-                            let (_, ref info_a) = active_items[i];
-                            let (_, ref info_b) = active_items[j];
-
-                            if let Some(conflicts) = check_cosmetic_conflict(info_a, info_b, ignore_quickswitch) {
-                                has_conflict = true;
-                                for rname in conflicts {
-                                    conflicting_region_names.insert(rname);
-                                }
-                            }
-                        }
-                    }
-
-                    let exceeds_limit = check_cosmetic_limit && active_items.len() > 3;
+                    let has_conflict = p_state.cached_loadout.has_conflict;
+                    let exceeds_limit = p_state.cached_loadout.exceeds_limit;
                     let is_violating = has_conflict || exceeds_limit;
-
-                    let hat_cosmetics_count = active_items
-                        .iter()
-                        .filter(|(_, info)| info.regions.iter().any(|r| *r == "hat"))
-                        .count();
-
-                    let is_preset_swap_candidate = has_conflict
-                        && active_items.len() <= 3
-                        && conflicting_region_names.len() == 1
-                        && conflicting_region_names.contains("hat")
-                        && hat_cosmetics_count == 2;
 
                     if is_violating {
                         p_state.conflict_ticks += 1;
@@ -385,21 +465,29 @@ impl<'a> CheatAlgorithm<'a> for InvalidEquipRegion {
                             p_state.post_reset_conflict_ticks += 1;
                         }
 
-                        let can_flag = if ignore_preset_swap && is_preset_swap_candidate {
+                        let preset_swap_candidate = p_state.cached_loadout.preset_swap_candidate;
+                        let can_flag = if params.ignore_preset_swap && preset_swap_candidate {
                             p_state.witnessed_in_pvs_reset
-                                && p_state.post_reset_conflict_ticks >= min_persistence_ticks
+                                && p_state.post_reset_conflict_ticks >= params.min_persistence_ticks
                         } else {
-                            p_state.conflict_ticks >= min_persistence_ticks
+                            p_state.conflict_ticks >= params.min_persistence_ticks
                         };
 
-                        if can_flag && !p_state.reported_loadouts.contains(&loadout_key) {
-                            p_state.reported_loadouts.insert(loadout_key);
+                        if can_flag
+                            && !p_state
+                                .reported_loadouts
+                                .contains(&p_state.cached_loadout.item_ids)
+                        {
+                            let loadout_key = p_state.cached_loadout.item_ids.clone();
+                            let regions = p_state.cached_loadout.conflicting_regions.clone();
+                            p_state.reported_loadouts.insert(loadout_key.clone());
 
-                            let duration_ticks = if ignore_preset_swap && is_preset_swap_candidate {
-                                p_state.post_reset_conflict_ticks
-                            } else {
-                                p_state.conflict_ticks
-                            };
+                            let duration_ticks =
+                                if params.ignore_preset_swap && preset_swap_candidate {
+                                    p_state.post_reset_conflict_ticks
+                                } else {
+                                    p_state.conflict_ticks
+                                };
 
                             let violation_type = if has_conflict && exceeds_limit {
                                 "equip_region_conflict_and_excess_cosmetics"
@@ -409,20 +497,19 @@ impl<'a> CheatAlgorithm<'a> for InvalidEquipRegion {
                                 "excess_cosmetic_count"
                             };
 
-                            let items_data: Vec<_> = active_items
+                            let items_data: Vec<_> = loadout_key
                                 .iter()
-                                .map(|(id, info)| {
-                                    json!({
-                                        "id": id,
-                                        "name": info.name,
-                                        "regions": info.regions,
-                                        "region_mask": format!("0x{:X}", info.region_mask),
+                                .filter_map(|item_id| {
+                                    get_cosmetic_info(*item_id).map(|info| {
+                                        json!({
+                                            "id": item_id,
+                                            "name": info.name,
+                                            "regions": info.regions,
+                                            "region_mask": format!("0x{:X}", info.region_mask),
+                                        })
                                     })
                                 })
                                 .collect();
-
-                            let mut regions_vec: Vec<_> = conflicting_region_names.into_iter().collect();
-                            regions_vec.sort();
 
                             detections.push(Detection {
                                 tick: self.current_tick,
@@ -431,12 +518,12 @@ impl<'a> CheatAlgorithm<'a> for InvalidEquipRegion {
                                 data: json!({
                                     "class": player.class_name(),
                                     "violation_type": violation_type,
-                                    "conflicting_regions": regions_vec,
-                                    "total_cosmetics": active_items.len(),
+                                    "conflicting_regions": regions,
+                                    "total_cosmetics": loadout_key.len(),
                                     "cosmetics": items_data,
                                     "duration_ticks": duration_ticks,
                                     "valve_server": is_valve_server,
-                                    "server_name": self.server_name.clone(),
+                                    "server_name": self.server_name,
                                 }),
                             });
                         }
@@ -468,7 +555,9 @@ mod tests {
     fn test_valve_servers_only_filter_enabled_community() {
         let mut algo = InvalidEquipRegion::new();
         algo.server_name = "UGC.TF | Trade #11 | FREE ITEMS!".to_string();
-        algo.params.insert("valve_servers_only".to_string(), Parameter::Bool(true));
+        algo.params
+            .insert("valve_servers_only".to_string(), Parameter::Bool(true));
+        algo.init().unwrap();
 
         let state = CheatAnalyserState::default();
         let pstate = ParserState::new(24, |_| false, false);
@@ -478,17 +567,26 @@ mod tests {
             std_dev: 0,
         });
 
-        let res = algo.on_message(&msg, &state, &pstate, DemoTick::from(100)).unwrap();
-        assert!(res.is_empty(), "Community server should be skipped when valve_servers_only is true");
+        let res = algo
+            .on_message(&msg, &state, &pstate, DemoTick::from(100))
+            .unwrap();
+        assert!(
+            res.is_empty(),
+            "Community server should be skipped when valve_servers_only is true"
+        );
     }
 
     #[test]
     fn test_valve_servers_only_filter_disabled_community() {
         let mut algo = InvalidEquipRegion::new();
         algo.server_name = "UGC.TF | Trade #11 | FREE ITEMS!".to_string();
-        algo.params.insert("valve_servers_only".to_string(), Parameter::Bool(false));
-        algo.params.insert("min_persistence_ticks".to_string(), Parameter::Int(1));
-        algo.params.insert("ignore_preset_swap".to_string(), Parameter::Bool(false));
+        algo.params
+            .insert("valve_servers_only".to_string(), Parameter::Bool(false));
+        algo.params
+            .insert("min_persistence_ticks".to_string(), Parameter::Int(1));
+        algo.params
+            .insert("ignore_preset_swap".to_string(), Parameter::Bool(false));
+        algo.init().unwrap();
 
         let player_ent = EntityId::from(10u32);
         let mut state = CheatAnalyserState::default();
@@ -501,24 +599,30 @@ mod tests {
         p.info = Some(uinfo.into());
         state.players.push(p);
 
-        algo.wearables.insert(EntityId::from(101u32), WearableEntityState {
-            owner: player_ent,
-            item_def_index: 378, // Team Captain (hat)
-            account_id: 1,
-            is_disguise: false,
-            nodraw: false,
-            last_seen_tick: 1,
-            spawn_generation: 0,
-        });
-        algo.wearables.insert(EntityId::from(102u32), WearableEntityState {
-            owner: player_ent,
-            item_def_index: 538, // Killer Exclusive (hat)
-            account_id: 1,
-            is_disguise: false,
-            nodraw: false,
-            last_seen_tick: 1,
-            spawn_generation: 0,
-        });
+        algo.wearables.insert(
+            EntityId::from(101u32),
+            WearableEntityState {
+                owner: player_ent,
+                item_def_index: 378, // Team Captain (hat)
+                account_id: 1,
+                is_disguise: false,
+                nodraw: false,
+                last_seen_tick: 1,
+                spawn_generation: 0,
+            },
+        );
+        algo.wearables.insert(
+            EntityId::from(102u32),
+            WearableEntityState {
+                owner: player_ent,
+                item_def_index: 538, // Killer Exclusive (hat)
+                account_id: 1,
+                is_disguise: false,
+                nodraw: false,
+                last_seen_tick: 1,
+                spawn_generation: 0,
+            },
+        );
 
         let pstate = ParserState::new(24, |_| false, false);
         let msg = Message::NetTick(NetTickMessage {
@@ -527,19 +631,32 @@ mod tests {
             std_dev: 0,
         });
 
-        let res = algo.on_message(&msg, &state, &pstate, DemoTick::from(1)).unwrap();
-        assert_eq!(res.len(), 1, "Community server should flag when valve_servers_only is false");
+        let res = algo
+            .on_message(&msg, &state, &pstate, DemoTick::from(1))
+            .unwrap();
+        assert_eq!(
+            res.len(),
+            1,
+            "Community server should flag when valve_servers_only is false"
+        );
         assert_eq!(res[0].data["valve_server"], false);
-        assert_eq!(res[0].data["server_name"], "UGC.TF | Trade #11 | FREE ITEMS!");
+        assert_eq!(
+            res[0].data["server_name"],
+            "UGC.TF | Trade #11 | FREE ITEMS!"
+        );
     }
 
     #[test]
     fn test_valve_servers_only_valve_server() {
         let mut algo = InvalidEquipRegion::new();
         algo.server_name = "Valve Matchmaking Server (Stockholm srcds2015-sto1 #69)".to_string();
-        algo.params.insert("valve_servers_only".to_string(), Parameter::Bool(true));
-        algo.params.insert("min_persistence_ticks".to_string(), Parameter::Int(1));
-        algo.params.insert("ignore_preset_swap".to_string(), Parameter::Bool(false));
+        algo.params
+            .insert("valve_servers_only".to_string(), Parameter::Bool(true));
+        algo.params
+            .insert("min_persistence_ticks".to_string(), Parameter::Int(1));
+        algo.params
+            .insert("ignore_preset_swap".to_string(), Parameter::Bool(false));
+        algo.init().unwrap();
 
         let player_ent = EntityId::from(10u32);
         let mut state = CheatAnalyserState::default();
@@ -552,24 +669,30 @@ mod tests {
         p.info = Some(uinfo.into());
         state.players.push(p);
 
-        algo.wearables.insert(EntityId::from(101u32), WearableEntityState {
-            owner: player_ent,
-            item_def_index: 378, // Team Captain (hat)
-            account_id: 1,
-            is_disguise: false,
-            nodraw: false,
-            last_seen_tick: 1,
-            spawn_generation: 0,
-        });
-        algo.wearables.insert(EntityId::from(102u32), WearableEntityState {
-            owner: player_ent,
-            item_def_index: 538, // Killer Exclusive (hat)
-            account_id: 1,
-            is_disguise: false,
-            nodraw: false,
-            last_seen_tick: 1,
-            spawn_generation: 0,
-        });
+        algo.wearables.insert(
+            EntityId::from(101u32),
+            WearableEntityState {
+                owner: player_ent,
+                item_def_index: 378, // Team Captain (hat)
+                account_id: 1,
+                is_disguise: false,
+                nodraw: false,
+                last_seen_tick: 1,
+                spawn_generation: 0,
+            },
+        );
+        algo.wearables.insert(
+            EntityId::from(102u32),
+            WearableEntityState {
+                owner: player_ent,
+                item_def_index: 538, // Killer Exclusive (hat)
+                account_id: 1,
+                is_disguise: false,
+                nodraw: false,
+                last_seen_tick: 1,
+                spawn_generation: 0,
+            },
+        );
 
         let pstate = ParserState::new(24, |_| false, false);
         let msg = Message::NetTick(NetTickMessage {
@@ -578,17 +701,28 @@ mod tests {
             std_dev: 0,
         });
 
-        let res = algo.on_message(&msg, &state, &pstate, DemoTick::from(1)).unwrap();
-        assert_eq!(res.len(), 1, "Valve server should flag when valve_servers_only is true");
+        let res = algo
+            .on_message(&msg, &state, &pstate, DemoTick::from(1))
+            .unwrap();
+        assert_eq!(
+            res.len(),
+            1,
+            "Valve server should flag when valve_servers_only is true"
+        );
         assert_eq!(res[0].data["valve_server"], true);
-        assert_eq!(res[0].data["server_name"], "Valve Matchmaking Server (Stockholm srcds2015-sto1 #69)");
+        assert_eq!(
+            res[0].data["server_name"],
+            "Valve Matchmaking Server (Stockholm srcds2015-sto1 #69)"
+        );
     }
 
     #[test]
     fn test_account_id_filtering() {
         let mut algo = InvalidEquipRegion::new();
         algo.server_name = "Valve Matchmaking Server (test)".to_string();
-        algo.params.insert("min_persistence_ticks".to_string(), Parameter::Int(1));
+        algo.params
+            .insert("min_persistence_ticks".to_string(), Parameter::Int(1));
+        algo.init().unwrap();
 
         let player_ent = EntityId::from(13u32);
         let steam_id64 = 76561199232172054u64; // account_id = 1271906326
@@ -605,26 +739,32 @@ mod tests {
         state.players.push(p);
 
         // Wearable 1: owned by player, def 940 (Ghostly Gibus, hat)
-        algo.wearables.insert(EntityId::from(101u32), WearableEntityState {
-            owner: player_ent,
-            item_def_index: 940,
-            account_id: player_account_id,
-            is_disguise: false,
-            nodraw: false,
-            last_seen_tick: 1,
-            spawn_generation: 0,
-        });
+        algo.wearables.insert(
+            EntityId::from(101u32),
+            WearableEntityState {
+                owner: player_ent,
+                item_def_index: 940,
+                account_id: player_account_id,
+                is_disguise: false,
+                nodraw: false,
+                last_seen_tick: 1,
+                spawn_generation: 0,
+            },
+        );
 
         // Wearable 2: orphaned entity with different account_id (e.g. 345727541 from disconnected player), def 471 (hat)
-        algo.wearables.insert(EntityId::from(102u32), WearableEntityState {
-            owner: player_ent,
-            item_def_index: 471,
-            account_id: 345727541, // Mismatch!
-            is_disguise: false,
-            nodraw: false,
-            last_seen_tick: 1,
-            spawn_generation: 0,
-        });
+        algo.wearables.insert(
+            EntityId::from(102u32),
+            WearableEntityState {
+                owner: player_ent,
+                item_def_index: 471,
+                account_id: 345727541, // Mismatch!
+                is_disguise: false,
+                nodraw: false,
+                last_seen_tick: 1,
+                spawn_generation: 0,
+            },
+        );
 
         let pstate = ParserState::new(24, |_| false, false);
         let msg = Message::NetTick(NetTickMessage {
@@ -633,8 +773,12 @@ mod tests {
             std_dev: 0,
         });
 
-        let res = algo.on_message(&msg, &state, &pstate, DemoTick::from(1)).unwrap();
-        assert!(res.is_empty(), "Orphaned wearable with mismatching account_id must be ignored and not cause conflict");
+        let res = algo
+            .on_message(&msg, &state, &pstate, DemoTick::from(1))
+            .unwrap();
+        assert!(
+            res.is_empty(),
+            "Orphaned wearable with mismatching account_id must be ignored and not cause conflict"
+        );
     }
 }
-

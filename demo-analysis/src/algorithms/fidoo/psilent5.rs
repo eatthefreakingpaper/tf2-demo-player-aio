@@ -1,8 +1,7 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use anyhow::Error;
 use serde_json::json;
-use steamid_ng::SteamID;
 use tf_demo_parser::demo::message::packetentities::{EntityId, UpdateType};
 use tf_demo_parser::demo::message::Message;
 use tf_demo_parser::demo::sendprop::SendPropIdentifier;
@@ -14,15 +13,16 @@ use crate::lib::algorithm::{CheatAlgorithm, Detection};
 use crate::lib::parameters::{get_parameter_value, Parameter, Parameters};
 use crate::util::helpers::{angle_delta, handle_to_entid, viewangle_delta};
 
-const HISTORY_TICKS: u32 = 36;
-const PIPE_VERTICAL_BOOST: f32 = 200.0;
-const TELEPORT_THRESHOLD: f32 = 350.0;
+const HISTORY_TICKS: u32 = 40;
+const TELEPORT_THRESHOLD: f32 = 400.0;
 
-// Standard and transition eye heights (ducking, crouch-jumping, standing)
+// Standard and transition eye heights: ducking (45), intermediate crouch transitions, and standing (68, 72)
 const EYE_HEIGHTS: [f32; 6] = [45.0, 50.0, 56.0, 62.0, 68.0, 72.0];
 
-// Candidate aim distances matching TF2 weapon engagement ranges and wall/floor convergence
-const AIM_DISTANCES: [f32; 8] = [48.0, 64.0, 96.0, 128.0, 256.0, 512.0, 1024.0, 2000.0];
+// Candidate target convergence distances in Hammer Units
+const CANDIDATE_DISTANCES: [f32; 9] = [
+    24.0, 48.0, 96.0, 192.0, 384.0, 768.0, 1536.0, 2000.0, 4000.0,
+];
 
 #[derive(Clone)]
 struct PlayerSnapshot {
@@ -31,9 +31,9 @@ struct PlayerSnapshot {
     yaw: f32,
     pitch: f32,
     simtime: u16,
-    _ping: u16,
     in_pvs: bool,
     state: PlayerState,
+    is_taunting: bool,
 }
 
 impl PlayerSnapshot {
@@ -44,9 +44,9 @@ impl PlayerSnapshot {
             yaw: player.view_angle,
             pitch: player.pitch_angle,
             simtime: player.simtime,
-            _ping: player.ping,
             in_pvs: player.in_pvs,
             state: player.state,
+            is_taunting: player.is_taunting() || (player.cond & (1 << 7)) != 0,
         }
     }
 }
@@ -73,7 +73,7 @@ struct TentativeDetection {
     serial: u32,
 }
 
-pub struct Psilent4 {
+pub struct Psilent5 {
     histories: HashMap<u64, VecDeque<PlayerSnapshot>>,
     pending: Vec<LaunchCandidate>,
     tentative: Vec<TentativeDetection>,
@@ -81,7 +81,7 @@ pub struct Psilent4 {
     params: Parameters,
 }
 
-impl Psilent4 {
+impl Psilent5 {
     pub fn new() -> Self {
         Self {
             histories: HashMap::new(),
@@ -89,9 +89,10 @@ impl Psilent4 {
             tentative: Vec::new(),
             observations: HashMap::new(),
             params: HashMap::from([
-                ("angle_threshold".to_string(), Parameter::Float(12.0)),
-                ("lookaround_ticks".to_string(), Parameter::Int(4)),
-                ("max_owner_distance".to_string(), Parameter::Float(105.0)),
+                ("enabled".to_string(), Parameter::Bool(true)),
+                ("angle_threshold".to_string(), Parameter::Float(6.0)),
+                ("lookaround_ticks".to_string(), Parameter::Int(18)),
+                ("max_owner_distance".to_string(), Parameter::Float(115.0)),
                 ("minimum_samples".to_string(), Parameter::Int(2)),
                 ("minimum_suspicious_launches".to_string(), Parameter::Int(2)),
             ]),
@@ -146,9 +147,8 @@ impl Psilent4 {
                 continue;
             }
 
-            // Support players with 150-200ms latency (up to 20 ticks)
             let ping_ticks = ((candidate.player_ping as f32 / 15.0).round() as u32).min(20);
-            let effective_lookaround = (lookaround_ticks + ping_ticks).max(16).min(32);
+            let effective_lookaround = (lookaround_ticks + ping_ticks).max(18).min(32);
 
             if !flush && current_tick < candidate.tick.saturating_add(effective_lookaround) {
                 waiting.push(candidate);
@@ -164,19 +164,19 @@ impl Psilent4 {
     }
 }
 
-impl Default for Psilent4 {
+impl Default for Psilent5 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl CheatAlgorithm<'_> for Psilent4 {
+impl CheatAlgorithm<'_> for Psilent5 {
     fn default(&self) -> bool {
         true
     }
 
     fn algorithm_name(&self) -> &str {
-        "fidoo/psilent4"
+        "fidoo/psilent5"
     }
 
     fn params(&mut self) -> Option<&mut Parameters> {
@@ -210,7 +210,6 @@ impl CheatAlgorithm<'_> for Psilent4 {
         };
         self.record_state(state);
         let tick = u32::from(state.tick);
-        let max_owner_distance = get_parameter_value::<f32>(&self.params, "max_owner_distance");
 
         for entity in &message.entities {
             if entity.update_type != UpdateType::Enter {
@@ -220,31 +219,28 @@ impl CheatAlgorithm<'_> for Psilent4 {
                 .server_classes
                 .get(usize::from(entity.server_class))
                 .map(|class| class.name.as_str())
-                .filter(|class| supported_projectile(class))
+                .filter(|class| is_accepted_projectile(class))
             else {
                 continue;
             };
-            let props: Vec<_> = entity.props(parser_state).collect();
-            let Some(owner_entity) = resolve_owner(&props, state) else {
+
+            let props = state.entity_props(entity, parser_state);
+
+            // 100% Reliable Networked Owner Verification
+            let Some(owner_steam_id) = resolve_owner_steam_id(&props, state) else {
                 continue;
             };
-            let Some(user_id) = state.get_userid_from_entid(owner_entity) else {
+
+            let Some(player) = state.get_player_by_sid(owner_steam_id) else {
                 continue;
             };
-            let Some(steam_id) = state.get_id64_from_userid(user_id) else {
-                continue;
-            };
-            let Some(player) = state
-                .players
-                .iter()
-                .find(|player| player_id(player) == Some(steam_id))
-            else {
-                continue;
-            };
-            if !player.in_pvs || player.state != PlayerState::Alive {
+
+            let is_taunting = player.is_taunting() || (player.cond & (1 << 7)) != 0;
+            if !player.in_pvs || player.state != PlayerState::Alive || is_taunting {
                 continue;
             }
 
+            // Extract projectile spawn origin
             let Some(origin) = projectile_vector(
                 &props,
                 &[
@@ -256,77 +252,28 @@ impl CheatAlgorithm<'_> for Psilent4 {
                 continue;
             };
 
-            let initial_velocity = if class == "CTFProjectile_MechanicalArmOrb"
-                || class == "CTFProjectile_BallOfFire"
-            {
-                let ang_rotation = projectile_vector(
-                    &props,
-                    &[
-                        ("DT_TFBaseRocket", "m_angRotation"),
-                        ("DT_BaseEntity", "m_angRotation"),
-                    ],
-                );
-                if let Some(rot) = ang_rotation {
-                    let speed = if class == "CTFProjectile_BallOfFire" {
-                        3000.0
-                    } else {
-                        1100.0
-                    };
-                    let dir = angles_to_vector(rot.y, rot.x);
-                    Vector {
-                        x: dir.x * speed,
-                        y: dir.y * speed,
-                        z: dir.z * speed,
-                    }
-                } else if let Some(vel) = projectile_vector(
-                    &props,
-                    &[
-                        ("DT_TFBaseRocket", "m_vInitialVelocity"),
-                        ("DT_TFWeaponBaseGrenadeProj", "m_vInitialVelocity"),
-                    ],
-                ) {
-                    vel
-                } else {
-                    continue;
-                }
-            } else {
-                let Some(vel) = projectile_vector(
-                    &props,
-                    &[
-                        ("DT_TFBaseRocket", "m_vInitialVelocity"),
-                        ("DT_TFWeaponBaseGrenadeProj", "m_vInitialVelocity"),
-                    ],
-                ) else {
-                    continue;
-                };
-                vel
-            };
-            if projectile_integer(
-                &props,
-                &[
-                    ("DT_TFBaseRocket", "m_iDeflected"),
-                    ("DT_TFWeaponBaseGrenadeProj", "m_iDeflected"),
-                ],
-            )
-            .is_some_and(|deflected| deflected > 0)
-                || projectile_integer(&props, &[("DT_TFProjectile_Pipebomb", "m_bTouched")])
-                    .is_some_and(|touched| touched > 0)
-            {
-                continue;
-            }
-            let pipe_type = projectile_integer(&props, &[("DT_TFProjectile_Pipebomb", "m_iType")]);
-            let velocity = if arcing_projectile(class) && pipe_type != Some(1) {
-                Vector {
-                    z: initial_velocity.z - PIPE_VERTICAL_BOOST,
-                    ..initial_velocity
-                }
-            } else {
-                initial_velocity
-            };
-            let Some(launch_direction) = normalized(velocity) else {
+            // Extract projectile launch velocity / direction
+            let Some(initial_velocity) = extract_initial_velocity(class, &props) else {
                 continue;
             };
 
+            // Filter out deflected or bounced projectiles
+            if is_deflected_or_touched(&props) {
+                continue;
+            }
+
+            let Some(launch_direction) = normalized(initial_velocity) else {
+                continue;
+            };
+
+            let player_class = player.class_name();
+            let weapon_name = state.get_player_weapon(player);
+            if is_excluded_weapon(&weapon_name) {
+                continue;
+            }
+            let pipe_type = projectile_integer(&props, &[("DT_TFProjectile_Pipebomb", "m_iType")]);
+
+            let max_owner_distance = get_parameter_value::<f32>(&self.params, "max_owner_distance");
             let offset = origin - player.position;
             let owner_distance = vector_length(offset);
             if !owner_distance.is_finite() || owner_distance > max_owner_distance {
@@ -342,16 +289,15 @@ impl CheatAlgorithm<'_> for Psilent4 {
                     // Refine candidate within same initial spawn burst across adjacent ticks
                 }
                 Some(_) => {
-                    // Entity re-entering PVS long after initial spawn (e.g. arrow stuck in wall), ignore
+                    // Re-entering PVS long after initial spawn (e.g. arrow stuck in wall), ignore
                     continue;
                 }
             }
-            let player_class = player.class_name();
-            let weapon_name = state.get_player_weapon(player);
-            self.record_snapshot(steam_id, PlayerSnapshot::new(tick, player));
+
+            self.record_snapshot(owner_steam_id, PlayerSnapshot::new(tick, player));
             self.pending.push(LaunchCandidate {
                 tick,
-                player: steam_id,
+                player: owner_steam_id,
                 player_class,
                 weapon_name,
                 player_ping: player.ping,
@@ -396,12 +342,12 @@ impl CheatAlgorithm<'_> for Psilent4 {
             *launch_counts.entry(*player).or_default() += 1;
         }
 
-        // Emit if minimum suspicious launches met OR if blatant high-delta single shot (>= 30.0 deg)
+        // Emit if minimum suspicious launches met OR if blatant high-delta single shot (>= 25.0 deg)
         let mut detections: Vec<_> = unique
             .into_values()
             .filter(|tentative| {
                 let delta = detection_delta(&tentative.detection);
-                delta >= 30.0
+                delta >= 25.0
                     || launch_counts
                         .get(&tentative.detection.player)
                         .is_some_and(|count| *count >= minimum_launches)
@@ -418,7 +364,8 @@ fn evaluate_candidate(
     histories: &HashMap<u64, VecDeque<PlayerSnapshot>>,
     candidate: LaunchCandidate,
 ) -> Option<TentativeDetection> {
-    if is_spread_rocket_launcher(&candidate.weapon_name) {
+    // Exclude random spread weapons (Beggar's Bazooka) and zero-damage practice weapons (Rocket Jumper, Sticky Jumper)
+    if is_excluded_weapon(&candidate.weapon_name) {
         return None;
     }
 
@@ -427,27 +374,28 @@ fn evaluate_candidate(
     let minimum_samples = get_parameter_value::<i32>(params, "minimum_samples").max(1) as usize;
     let history = histories.get(&candidate.player)?;
     let ping_ticks = ((candidate.player_ping as f32 / 15.0).round() as u32).min(20);
-    let effective_lookaround = (lookaround_ticks + ping_ticks).max(16).min(32);
+    let effective_lookaround = (lookaround_ticks + ping_ticks).max(18).min(32);
     let start_tick = candidate.tick.saturating_sub(effective_lookaround);
     let end_tick = candidate.tick.saturating_add(effective_lookaround);
+
     let samples: Vec<_> = history
         .iter()
         .filter(|sample| {
             (start_tick..=end_tick).contains(&sample.tick)
                 && sample.in_pvs
                 && sample.state == PlayerState::Alive
+                && !sample.is_taunting
         })
         .collect();
 
-    if samples.len() < minimum_samples
-        || samples.first()?.tick > candidate.tick
-        || samples.last()?.tick < candidate.tick
-    {
+    if samples.len() < minimum_samples {
         return None;
     }
 
-    let simtimes: HashSet<_> = samples.iter().map(|sample| sample.simtime).collect();
-    if simtimes.len() < 2 {
+    if history
+        .iter()
+        .any(|s| s.tick.abs_diff(candidate.tick) <= 2 && s.is_taunting)
+    {
         return None;
     }
 
@@ -461,11 +409,15 @@ fn evaluate_candidate(
     }
 
     let launch_angles = vector_angles(candidate.launch_direction);
+    let speed = vector_length(candidate.initial_velocity);
+    let is_pipebomb = candidate.projectile == "CTFGrenadePipebombProjectile";
+
     let mut raw_delta = f32::INFINITY;
     let mut compensated_delta = f32::INFINITY;
     let mut best_view = (0.0, 0.0);
     let mut best_tick = candidate.tick;
 
+    // Generate test views from recorded snapshots and interpolated sub-tick frames
     let mut test_views = Vec::new();
     for sample in &samples {
         test_views.push((sample.tick, sample.position, sample.yaw, sample.pitch));
@@ -499,112 +451,158 @@ fn evaluate_candidate(
         }
     }
 
-    // Check if launch is a steep downward shot (ground rocket jump / feet shot)
-    let is_downward_shot = candidate.launch_direction.z < -0.35;
-
+    // Continuous Yaw Compensation & Convergence Evaluation
     for (tick, pos, yaw, pitch) in test_views {
         let view = (yaw, pitch);
-        raw_delta = raw_delta.min(angle_delta(view, launch_angles));
+        let current_raw = angle_delta(view, launch_angles);
+        if current_raw < raw_delta {
+            raw_delta = current_raw;
+        }
 
-        for eye_height in EYE_HEIGHTS {
-            if let Some(opt_angles) = optimal_muzzle_compensation(
-                candidate.origin,
-                candidate.launch_direction,
-                pos,
-                eye_height,
-                yaw,
-                pitch,
-            ) {
-                let delta = angle_delta(view, opt_angles);
-                if delta < compensated_delta {
-                    compensated_delta = delta;
+        let v_view = angles_to_vector(yaw, pitch);
+        let v_up = angles_to_up_vector(yaw, pitch);
+
+        // For CTFGrenadePipebombProjectile, Source engine adds vecUp * 200.0f
+        // (CTFGrenadePipebombProjectile::Create). We check both with upward arc and unboosted (e.g. Loose Cannon)
+        let arc_boost_candidates: &[(bool, f32)] = if is_pipebomb && speed > 210.0 {
+            &[(true, 200.0), (false, 0.0)]
+        } else {
+            &[(false, 0.0)]
+        };
+
+        for &eye_height in &EYE_HEIGHTS {
+            let eye = Vector {
+                z: pos.z + eye_height,
+                ..pos
+            };
+
+            for &(use_arc, arc_boost) in arc_boost_candidates {
+                // 1. Direct view angle alignment (infinite distance target: d -> infinity)
+                let expected_direct = if use_arc {
+                    let fwd_speed = (speed * speed - arc_boost * arc_boost).max(0.0).sqrt();
+                    let v = Vector {
+                        x: v_view.x * fwd_speed + v_up.x * arc_boost,
+                        y: v_view.y * fwd_speed + v_up.y * arc_boost,
+                        z: v_view.z * fwd_speed + v_up.z * arc_boost,
+                    };
+                    normalized(v).unwrap_or(v_view)
+                } else {
+                    v_view
+                };
+                let direct_angles = vector_angles(expected_direct);
+                let direct_delta = angle_delta(direct_angles, launch_angles);
+                if direct_delta < compensated_delta {
+                    compensated_delta = direct_delta;
                     best_view = view;
                     best_tick = tick;
                 }
-            }
 
-            if (pitch > 35.0 || is_downward_shot) && candidate.launch_direction.z < -0.01 {
-                let eye = Vector {
-                    z: pos.z + eye_height,
-                    ..pos
-                };
-                let ground_z = pos.z;
-                let t_ground = (ground_z - candidate.origin.z) / candidate.launch_direction.z;
-                if t_ground > 0.0 && t_ground < 1000.0 {
-                    let impact = Vector {
-                        x: candidate.origin.x + candidate.launch_direction.x * t_ground,
-                        y: candidate.origin.y + candidate.launch_direction.y * t_ground,
-                        z: ground_z,
-                    };
-                    let v_view = angles_to_vector(yaw, pitch);
-                    if v_view.z < -0.01 {
-                        let t_eye = (ground_z - eye.z) / v_view.z;
-                        if t_eye > 0.0 {
-                            let eye_impact = Vector {
-                                x: eye.x + v_view.x * t_eye,
-                                y: eye.y + v_view.y * t_eye,
-                                z: ground_z,
-                            };
-                            let diff = impact - eye_impact;
-                            if diff.x * diff.x + diff.y * diff.y <= 2500.0 {
-                                if let Some(ground_dir) = normalized(impact - eye) {
-                                    let ground_angles = vector_angles(ground_dir);
-                                    let delta = angle_delta(view, ground_angles);
-                                    if delta < compensated_delta {
-                                        compensated_delta = delta;
-                                        best_view = view;
-                                        best_tick = tick;
-                                    }
+                // 2. Analytical closest approach distance d* along sightline ray
+                let w = eye - candidate.origin;
+                let c = dot(candidate.launch_direction, expected_direct);
+                let denom = 1.0 - c * c;
+                if denom > 1e-6 {
+                    let d_star =
+                        (c * dot(candidate.launch_direction, w) - dot(expected_direct, w)) / denom;
+                    if d_star > 10.0 && d_star < 8000.0 {
+                        let target = Vector {
+                            x: eye.x + v_view.x * d_star,
+                            y: eye.y + v_view.y * d_star,
+                            z: eye.z + v_view.z * d_star,
+                        };
+                        if let Some(mut expected_dir) = normalized(target - candidate.origin) {
+                            if use_arc {
+                                let fwd_speed =
+                                    (speed * speed - arc_boost * arc_boost).max(0.0).sqrt();
+                                let v = Vector {
+                                    x: expected_dir.x * fwd_speed + v_up.x * arc_boost,
+                                    y: expected_dir.y * fwd_speed + v_up.y * arc_boost,
+                                    z: expected_dir.z * fwd_speed + v_up.z * arc_boost,
+                                };
+                                if let Some(n) = normalized(v) {
+                                    expected_dir = n;
                                 }
+                            }
+                            let expected_angles = vector_angles(expected_dir);
+                            let delta = angle_delta(launch_angles, expected_angles);
+                            if delta < compensated_delta {
+                                compensated_delta = delta;
+                                best_view = view;
+                                best_tick = tick;
                             }
                         }
                     }
                 }
-            }
 
-            for &aim_distance in &AIM_DISTANCES {
-                let Some(compensated_angles) = compensate_muzzle_offset(
-                    candidate.origin,
-                    candidate.launch_direction,
-                    pos,
-                    eye_height,
-                    aim_distance,
-                ) else {
-                    continue;
-                };
-                let delta = angle_delta(view, compensated_angles);
-                if delta < compensated_delta {
-                    compensated_delta = delta;
-                    best_view = view;
-                    best_tick = tick;
+                // 3. Ground plane impact distance for downward shots / rocket jumps
+                if pitch > 20.0 && v_view.z < -0.05 {
+                    let d_ground = eye_height / (-v_view.z);
+                    if d_ground > 10.0 && d_ground < 1500.0 {
+                        let target = Vector {
+                            x: eye.x + v_view.x * d_ground,
+                            y: eye.y + v_view.y * d_ground,
+                            z: pos.z,
+                        };
+                        if let Some(mut expected_dir) = normalized(target - candidate.origin) {
+                            if use_arc {
+                                let fwd_speed =
+                                    (speed * speed - arc_boost * arc_boost).max(0.0).sqrt();
+                                let v = Vector {
+                                    x: expected_dir.x * fwd_speed + v_up.x * arc_boost,
+                                    y: expected_dir.y * fwd_speed + v_up.y * arc_boost,
+                                    z: expected_dir.z * fwd_speed + v_up.z * arc_boost,
+                                };
+                                if let Some(n) = normalized(v) {
+                                    expected_dir = n;
+                                }
+                            }
+                            let expected_angles = vector_angles(expected_dir);
+                            let delta = angle_delta(launch_angles, expected_angles);
+                            if delta < compensated_delta {
+                                compensated_delta = delta;
+                                best_view = view;
+                                best_tick = tick;
+                            }
+                        }
+                    }
                 }
 
-                let eye = Vector {
-                    z: pos.z + eye_height,
-                    ..pos
-                };
-                let v_view = angles_to_vector(yaw, pitch);
-                let target = Vector {
-                    x: eye.x + v_view.x * aim_distance,
-                    y: eye.y + v_view.y * aim_distance,
-                    z: eye.z + v_view.z * aim_distance,
-                };
-                if let Some(dir) = normalized(target - candidate.origin) {
-                    let expected_angles = vector_angles(dir);
-                    let delta = angle_delta(launch_angles, expected_angles);
-                    if delta < compensated_delta {
-                        compensated_delta = delta;
-                        best_view = view;
-                        best_tick = tick;
+                // 4. Candidate engagement distances covering close to far ranges
+                for &dist in &CANDIDATE_DISTANCES {
+                    let target = Vector {
+                        x: eye.x + v_view.x * dist,
+                        y: eye.y + v_view.y * dist,
+                        z: eye.z + v_view.z * dist,
+                    };
+                    if let Some(mut expected_dir) = normalized(target - candidate.origin) {
+                        if use_arc {
+                            let fwd_speed = (speed * speed - arc_boost * arc_boost).max(0.0).sqrt();
+                            let v = Vector {
+                                x: expected_dir.x * fwd_speed + v_up.x * arc_boost,
+                                y: expected_dir.y * fwd_speed + v_up.y * arc_boost,
+                                z: expected_dir.z * fwd_speed + v_up.z * arc_boost,
+                            };
+                            if let Some(n) = normalized(v) {
+                                expected_dir = n;
+                            }
+                        }
+                        let expected_angles = vector_angles(expected_dir);
+                        let delta = angle_delta(launch_angles, expected_angles);
+                        if delta < compensated_delta {
+                            compensated_delta = delta;
+                            best_view = view;
+                            best_tick = tick;
+                        }
                     }
                 }
             }
         }
     }
 
-    // Dynamic threshold: for steep downward rocket jumping shots with high muzzle parallax, allow ground tolerance buffer
-    let effective_threshold = if is_downward_shot && candidate.weapon_name.contains("Rocket") {
-        angle_threshold + 6.0
+    let is_downward_rocket =
+        candidate.launch_direction.z < -0.35 && candidate.projectile == "CTFProjectile_Rocket";
+    let effective_threshold = if is_downward_rocket {
+        angle_threshold + 1.5
     } else {
         angle_threshold
     };
@@ -613,12 +611,20 @@ fn evaluate_candidate(
         return None;
     }
 
+    let yaw_diff = (launch_angles.0 - best_view.0).rem_euclid(360.0);
+    let yaw_delta = if yaw_diff > 180.0 {
+        360.0 - yaw_diff
+    } else {
+        yaw_diff
+    };
+    let pitch_delta = (launch_angles.1 - best_view.1).abs();
+
     Some(TentativeDetection {
         projectile_entity: candidate.projectile_entity,
         serial: candidate.serial,
         detection: Detection {
             tick: candidate.tick,
-            algorithm: "fidoo/psilent4".to_string(),
+            algorithm: "fidoo/psilent5".to_string(),
             player: candidate.player,
             data: json!({
                 "class": candidate.player_class,
@@ -633,10 +639,11 @@ fn evaluate_candidate(
                 "view_tick": best_tick,
                 "raw_angle_delta": raw_delta,
                 "compensated_angle_delta": compensated_delta,
+                "yaw_delta": yaw_delta,
+                "pitch_delta": pitch_delta,
                 "owner_distance": candidate.owner_distance,
                 "pipe_type": candidate.pipe_type,
                 "samples": samples.len(),
-                "simtime_samples": simtimes.len(),
             }),
         },
     })
@@ -648,43 +655,142 @@ fn detection_delta(detection: &Detection) -> f64 {
         .unwrap_or_default()
 }
 
-fn is_spread_rocket_launcher(weapon_name: &str) -> bool {
-    weapon_name == "Beggar's Bazooka"
-        || weapon_name == "Air Strike"
-        || weapon_name.contains("Beggar")
-        || weapon_name.contains("Air Strike")
-        || weapon_name.contains("Airstrike")
+fn is_excluded_weapon(weapon_name: &str) -> bool {
+    weapon_name.contains("Beggar")
+        || weapon_name.contains("Rocket Jumper")
+        || weapon_name.contains("Sticky Jumper")
 }
 
-fn supported_projectile(class: &str) -> bool {
-    (class == "CTFGrenadePipebombProjectile" || class.starts_with("CTFProjectile_"))
-        && class != "CTFProjectile_SentryRocket"
-}
-
-fn arcing_projectile(class: &str) -> bool {
-    matches!(
-        class,
-        "CTFGrenadePipebombProjectile"
-            | "CTFProjectile_Cleaver"
-            | "CTFProjectile_Jar"
-            | "CTFProjectile_JarMilk"
-            | "CTFProjectile_ThrowableBreadMonster"
-    )
-}
-
-fn resolve_owner(
+// 100% Reliable Owner Resolution:
+// Resolves entity handles from m_hThrower (grenade/sticky priority) and m_hOwnerEntity (rockets/flares/arrows/etc.)
+// Maps to player entity and SteamID64
+fn resolve_owner_steam_id(
     props: &[tf_demo_parser::demo::sendprop::SendProp],
     state: &CheatAnalyserState,
-) -> Option<EntityId> {
+) -> Option<u64> {
     const OWNER: SendPropIdentifier = SendPropIdentifier::new("DT_BaseEntity", "m_hOwnerEntity");
     const THROWER: SendPropIdentifier = SendPropIdentifier::new("DT_BaseGrenade", "m_hThrower");
 
-    props
-        .iter()
-        .filter(|prop| matches!(prop.identifier, OWNER | THROWER))
-        .filter_map(|prop| i64::try_from(&prop.value).ok())
-        .map(|handle| handle_to_entid(handle as u32))
-        .find(|entity| state.get_userid_from_entid(*entity).is_some())
+    // Priority 1: m_hThrower (pipes, stickies)
+    if let Some(prop) = props.iter().find(|p| p.identifier == THROWER) {
+        if let Ok(handle) = i64::try_from(&prop.value) {
+            let entid = handle_to_entid(handle as u32);
+            if let Some(steam_id) = steam_id_from_entid(entid, state) {
+                return Some(steam_id);
+            }
+        }
+    }
+
+    // Priority 2: m_hOwnerEntity (rockets, flares, crossbow bolts, syringes, arrows, energy orbs)
+    if let Some(prop) = props.iter().find(|p| p.identifier == OWNER) {
+        if let Ok(handle) = i64::try_from(&prop.value) {
+            let entid = handle_to_entid(handle as u32);
+            if let Some(steam_id) = steam_id_from_entid(entid, state) {
+                return Some(steam_id);
+            }
+        }
+    }
+
+    None
+}
+
+fn steam_id_from_entid(entid: EntityId, state: &CheatAnalyserState) -> Option<u64> {
+    if u32::from(entid) >= 2047 || u32::from(entid) == 0 {
+        return None;
+    }
+    state.steam_id_for_entity(entid)
+}
+
+fn is_accepted_projectile(class: &str) -> bool {
+    match class {
+        "CTFProjectile_Rocket"
+        | "CTFGrenadePipebombProjectile"
+        | "CTFProjectile_Flare"
+        | "CTFProjectile_BallOfFire"
+        | "CTFProjectile_HealingBolt"
+        | "CTFProjectile_Syringe"
+        | "CTFProjectile_Arrow"
+        | "CTFProjectile_EnergyBall"
+        | "CTFProjectile_EnergyRing"
+        | "CTFProjectile_MechanicalArmOrb" => true,
+        _ => false,
+    }
+}
+
+fn is_deflected_or_touched(props: &[tf_demo_parser::demo::sendprop::SendProp]) -> bool {
+    let deflected = projectile_integer(
+        props,
+        &[
+            ("DT_TFBaseRocket", "m_iDeflected"),
+            ("DT_TFWeaponBaseGrenadeProj", "m_iDeflected"),
+        ],
+    );
+    if deflected.is_some_and(|d| d > 0) {
+        return true;
+    }
+
+    let touched = projectile_integer(props, &[("DT_TFProjectile_Pipebomb", "m_bTouched")]);
+    touched.is_some_and(|t| t > 0)
+}
+
+fn extract_initial_velocity(
+    class: &str,
+    props: &[tf_demo_parser::demo::sendprop::SendProp],
+) -> Option<Vector> {
+    if class == "CTFProjectile_MechanicalArmOrb" || class == "CTFProjectile_BallOfFire" {
+        let ang_rotation = projectile_vector(
+            props,
+            &[
+                ("DT_TFBaseRocket", "m_angRotation"),
+                ("DT_BaseEntity", "m_angRotation"),
+            ],
+        );
+        if let Some(rot) = ang_rotation {
+            let speed = if class == "CTFProjectile_BallOfFire" {
+                3000.0
+            } else {
+                1100.0
+            };
+            let dir = angles_to_vector(rot.y, rot.x);
+            return Some(Vector {
+                x: dir.x * speed,
+                y: dir.y * speed,
+                z: dir.z * speed,
+            });
+        }
+    }
+
+    let vel = projectile_vector(
+        props,
+        &[
+            ("DT_TFBaseRocket", "m_vInitialVelocity"),
+            ("DT_TFWeaponBaseGrenadeProj", "m_vInitialVelocity"),
+        ],
+    );
+    if let Some(v) = vel {
+        if vector_length(v) > 1.0 {
+            return Some(v);
+        }
+    }
+
+    // Fallback to m_angRotation if initial velocity is missing/zero
+    let ang_rotation = projectile_vector(
+        props,
+        &[
+            ("DT_TFBaseRocket", "m_angRotation"),
+            ("DT_BaseEntity", "m_angRotation"),
+        ],
+    );
+    if let Some(rot) = ang_rotation {
+        let dir = angles_to_vector(rot.y, rot.x);
+        return Some(Vector {
+            x: dir.x * 1100.0,
+            y: dir.y * 1100.0,
+            z: dir.z * 1100.0,
+        });
+    }
+
+    None
 }
 
 fn projectile_vector(
@@ -714,88 +820,7 @@ fn projectile_integer(
 }
 
 fn player_id(player: &Player) -> Option<u64> {
-    let info = player.info.as_ref()?;
-    if info.steam_id == "BOT" {
-        return None;
-    }
-    SteamID::from_steam3(&info.steam_id).ok().map(u64::from)
-}
-
-fn optimal_muzzle_compensation(
-    origin: Vector,
-    direction: Vector,
-    player_origin: Vector,
-    eye_height: f32,
-    view_yaw: f32,
-    view_pitch: f32,
-) -> Option<(f32, f32)> {
-    let eye = Vector {
-        z: player_origin.z + eye_height,
-        ..player_origin
-    };
-    let v_view = angles_to_vector(view_yaw, view_pitch);
-    let x = origin - eye;
-    let v_dot_d = dot(v_view, direction);
-    let denom = 1.0 - v_dot_d * v_dot_d;
-    if denom.abs() < 1e-6 {
-        return None;
-    }
-    let v_dot_x = dot(v_view, x);
-    let x_dot_d = dot(x, direction);
-    let t = (v_dot_x * v_dot_d - x_dot_d) / denom;
-    if t <= 0.0 || t > 4000.0 {
-        return None;
-    }
-    let s = v_dot_x + t * v_dot_d;
-    if s <= 0.0 {
-        return None;
-    }
-    let p_proj = Vector {
-        x: origin.x + direction.x * t,
-        y: origin.y + direction.y * t,
-        z: origin.z + direction.z * t,
-    };
-    let p_eye = Vector {
-        x: eye.x + v_view.x * s,
-        y: eye.y + v_view.y * s,
-        z: eye.z + v_view.z * s,
-    };
-    let diff = p_proj - p_eye;
-    let miss_dist_sq = diff.x * diff.x + diff.y * diff.y + diff.z * diff.z;
-    if miss_dist_sq > 400.0 {
-        return None;
-    }
-    let target = p_proj - eye;
-    normalized(target).map(vector_angles)
-}
-
-fn compensate_muzzle_offset(
-    origin: Vector,
-    direction: Vector,
-    player_origin: Vector,
-    eye_height: f32,
-    aim_distance: f32,
-) -> Option<(f32, f32)> {
-    let eye = Vector {
-        z: player_origin.z + eye_height,
-        ..player_origin
-    };
-    let offset = origin - eye;
-    let along = dot(offset, direction);
-    let discriminant = along * along - (dot(offset, offset) - aim_distance * aim_distance);
-    if discriminant < 0.0 {
-        return None;
-    }
-    let travel = -along + discriminant.sqrt();
-    if travel <= 0.0 {
-        return None;
-    }
-    let target_direction = Vector {
-        x: origin.x + direction.x * travel - eye.x,
-        y: origin.y + direction.y * travel - eye.y,
-        z: origin.z + direction.z * travel - eye.z,
-    };
-    normalized(target_direction).map(vector_angles)
+    player.steam_id()
 }
 
 fn normalized(vector: Vector) -> Option<Vector> {
@@ -833,5 +858,36 @@ fn angles_to_vector(yaw_deg: f32, pitch_deg: f32) -> Vector {
         x: yaw_rad.cos() * pitch_rad.cos(),
         y: yaw_rad.sin() * pitch_rad.cos(),
         z: -pitch_rad.sin(),
+    }
+}
+
+fn angles_to_up_vector(yaw_deg: f32, pitch_deg: f32) -> Vector {
+    let yaw_rad = yaw_deg.to_radians();
+    let pitch_rad = pitch_deg.to_radians();
+    Vector {
+        x: pitch_rad.sin() * yaw_rad.cos(),
+        y: pitch_rad.sin() * yaw_rad.sin(),
+        z: pitch_rad.cos(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_angles_roundtrip() {
+        let dir = angles_to_vector(45.0, 15.0);
+        let (yaw, pitch) = vector_angles(dir);
+        assert!((yaw - 45.0).abs() < 0.01);
+        assert!((pitch - 15.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_forward_up_orthogonality() {
+        let fwd = angles_to_vector(35.0, 20.0);
+        let up = angles_to_up_vector(35.0, 20.0);
+        let d = dot(fwd, up);
+        assert!(d.abs() < 1e-5, "forward and up must be orthogonal");
     }
 }

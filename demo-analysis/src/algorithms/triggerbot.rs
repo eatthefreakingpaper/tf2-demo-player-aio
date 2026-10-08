@@ -149,6 +149,7 @@ mod tests {
 
     fn recorder_player(state: &mut CheatAnalyserState) {
         state.players = vec![Player {
+            steam_id64: None,
             entity: EntityId::from(1u32),
             position: Default::default(),
             health: 125,
@@ -253,10 +254,7 @@ mod tests {
         let mut state = CheatAnalyserState::default();
         recorder_player(&mut state);
         // "+attack2" (secondary fire) must not count as "+attack".
-        push_cmds(
-            &mut state,
-            &[(100, "+attack2 108"), (110, "-attack2 109")],
-        );
+        push_cmds(&mut state, &[(100, "+attack2 108"), (110, "-attack2 109")]);
         assert!(run(&mut algo, &state).is_empty());
     }
 

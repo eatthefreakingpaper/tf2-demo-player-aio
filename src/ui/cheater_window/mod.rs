@@ -60,16 +60,23 @@ pub struct CheaterModel {
     // past the on-screen row cap.
     report: String,
 
-    // Mass analysis work queue: demos are analysed one at a time, results
-    // accumulate, and more demos can be enqueued while the queue drains.
+    // Mass analysis work queue. Each queued demo gets one parser pass and the
+    // configured worker budget is spent across demos instead of reparsing one
+    // demo on every worker.
     queue: VecDeque<Demo>,
     // Settings snapshot taken when the current queue session started, so the
     // next queued demo can be started without the caller re-sending them.
-    queue_settings: Option<(HashMap<String, bool>, demo_analysis::lib::parameters::Config, usize)>,
+    queue_settings: Option<(
+        HashMap<String, bool>,
+        demo_analysis::lib::parameters::Config,
+        usize,
+    )>,
     mass_mode: bool,
     demos_done: usize,
     demos_total: usize,
     current_demo: Option<String>,
+    active_demos: usize,
+    progress_by_demo: HashMap<String, (u32, u32, f32)>,
     accumulated: Vec<Detection>,
     name_lookup: HashMap<u64, String>,
     queue_errors: Vec<(String, String)>,
@@ -77,6 +84,23 @@ pub struct CheaterModel {
 
 impl CheaterModel {
     fn progress_text(&self) -> String {
+        if self.mass_mode {
+            let worker_word = if self.threads == 1 {
+                "worker"
+            } else {
+                "workers"
+            };
+            return format!(
+                "{} / {} demos complete; {} active; {:.0} ticks/sec - {} {}",
+                self.demos_done,
+                self.demos_total,
+                self.active_demos,
+                self.tps,
+                self.threads,
+                worker_word,
+            );
+        }
+
         let (current, total) = self.progress;
         if total == 0 {
             return "Starting up...".to_string();
@@ -91,18 +115,8 @@ impl CheaterModel {
         } else {
             format!("{} background threads", self.threads)
         };
-        let queue_prefix = if self.mass_mode {
-            format!(
-                "demo {}/{} ({}) - ",
-                self.demos_done + 1,
-                self.demos_total,
-                self.current_demo.as_deref().unwrap_or("?")
-            )
-        } else {
-            String::new()
-        };
         format!(
-            "{queue_prefix}tick {}/{} ({:.0} ticks/sec) - ETA {} - {}",
+            "tick {}/{} ({:.0} ticks/sec) - ETA {} - {}",
             current, total, self.tps, eta, threads
         )
     }
@@ -116,71 +130,88 @@ impl CheaterModel {
         self.name_lookup.clear();
         self.queue_errors.clear();
         self.current_demo = None;
+        self.active_demos = 0;
+        self.progress_by_demo.clear();
     }
 
-    // Pops the next demo off the queue and analyses it. Called when a session
-    // starts and again from the Done handler until the queue is empty.
-    fn start_next_demo(&mut self, sender: &ComponentSender<Self>) {
-        let Some(dem) = self.queue.pop_front() else {
-            return;
-        };
-        let Some((enabled_overrides, param_overrides, threads)) = self.queue_settings.clone() else {
+    // Starts as many queued demos as the worker budget allows. Batch mode uses
+    // one parser pass per demo; a single-demo check may use two algorithm
+    // workers because that was the useful point in the measured scaling curve.
+    fn start_available_demos(&mut self, sender: &ComponentSender<Self>) {
+        let Some((enabled_overrides, param_overrides, configured_workers)) =
+            self.queue_settings.clone()
+        else {
             return;
         };
 
-        self.current_demo = Some(dem.filename.clone());
-        self.loading = true;
-        self.progress = (0, 0);
-        self.tps = 0.0;
-        self.threads = threads.max(1);
-        let effective_threads = self.threads;
-        let mut dem = dem;
-        sender.clone().spawn_command(move |s| {
-            let start = std::time::Instant::now();
-            // Track each analysis thread's latest tick so the reported progress reflects
-            // the *slowest* thread rather than whichever happens to report last. Without
-            // this, a fast thread (lighter algorithms) can make the ETA look almost done
-            // while heavier algorithms are still far behind.
-            // Initialized to MAX so threads that don't exist (fewer algorithms than
-            // threads) don't drag the minimum down.
-            let thread_ticks: Vec<std::sync::atomic::AtomicU32> = (0..effective_threads)
-                .map(|_| std::sync::atomic::AtomicU32::new(u32::MAX))
-                .collect();
-            let thread_ticks = std::sync::Arc::new(thread_ticks);
-            let result: Result<(Vec<Detection>, HashMap<u64, String>)> = (|| {
-                let detections = dem.detect_cheaters(
-                    &enabled_overrides,
-                    &param_overrides,
-                    threads,
-                    |thread_idx, current, total| {
-                        thread_ticks[thread_idx].store(current, std::sync::atomic::Ordering::Relaxed);
-                        // Effective progress = the slowest thread's position.
-                        let min_current = thread_ticks
-                            .iter()
-                            .map(|t| t.load(std::sync::atomic::Ordering::Relaxed))
-                            .filter(|&v| v != u32::MAX)
-                            .min()
-                            .unwrap_or(current);
-                        let elapsed = start.elapsed().as_secs_f32();
-                        let tps = if elapsed > 0.0 && min_current > 0 {
-                            min_current as f32 / elapsed
-                        } else {
-                            0.0
-                        };
-                        s.emit(CheaterCmd::Progress(min_current, total, tps));
-                    },
-                )?;
-                let detections = (*detections).clone();
-                // Make sure we have names to show alongside each flagged SteamID. The
-                // detection pass doesn't collect usernames, so scrape the player list
-                // here if it wasn't already indexed.
-                if dem.players.is_none() {
-                    let _ = pollster::block_on(dem.index_players());
-                }
-                Ok((detections, build_name_lookup(&dem)))
-            })();
-            s.emit(CheaterCmd::Done(result));
-        });
+        let configured_workers = configured_workers.max(1);
+        let max_parallel_demos = if self.mass_mode {
+            let hardware_cap = std::thread::available_parallelism()
+                .map(|threads| (threads.get() + 1) / 2)
+                .unwrap_or(1);
+            configured_workers.min(hardware_cap).max(1)
+        } else {
+            1
+        };
+        self.threads = if self.mass_mode {
+            max_parallel_demos
+        } else {
+            configured_workers.min(2)
+        };
+
+        while self.active_demos < max_parallel_demos {
+            let Some(mut dem) = self.queue.pop_front() else {
+                break;
+            };
+            let enabled_overrides = enabled_overrides.clone();
+            let param_overrides = param_overrides.clone();
+            let demo_name = dem.filename.clone();
+            let progress_name = demo_name.clone();
+            let per_demo_threads = if self.mass_mode { 1 } else { self.threads };
+
+            self.current_demo = Some(demo_name.clone());
+            self.active_demos += 1;
+            self.progress_by_demo.insert(demo_name.clone(), (0, 0, 0.0));
+            self.loading = true;
+
+            let mass_mode = self.mass_mode;
+            sender.clone().spawn_command(move |s| {
+                let start = std::time::Instant::now();
+                let result: Result<(Vec<Detection>, HashMap<u64, String>)> = (|| {
+                    let (detections, mut names) = dem.detect_cheaters(
+                        &enabled_overrides,
+                        &param_overrides,
+                        per_demo_threads,
+                        |_, current, total| {
+                            let elapsed = start.elapsed().as_secs_f32();
+                            let tps = if elapsed > 0.0 && current > 0 {
+                                current as f32 / elapsed
+                            } else {
+                                0.0
+                            };
+                            s.emit(CheaterCmd::Progress(
+                                progress_name.clone(),
+                                current,
+                                total,
+                                tps,
+                            ));
+                        },
+                    )?;
+                    // Inspection/index data can add historical names, but the
+                    // detection pass now supplies the complete primary lookup.
+                    names.extend(build_name_lookup(&dem));
+                    let detections = if mass_mode {
+                        dem.cheat_detections = None;
+                        std::sync::Arc::try_unwrap(detections)
+                            .unwrap_or_else(|detections| (*detections).clone())
+                    } else {
+                        (*detections).clone()
+                    };
+                    Ok((detections, names))
+                })();
+                s.emit(CheaterCmd::Done(demo_name, dem, result));
+            });
+        }
     }
 }
 
@@ -218,8 +249,8 @@ pub enum CheaterOut {
 
 #[derive(Debug)]
 pub enum CheaterCmd {
-    Progress(u32, u32, f32),
-    Done(Result<(Vec<Detection>, HashMap<u64, String>)>),
+    Progress(String, u32, u32, f32),
+    Done(String, Demo, Result<(Vec<Detection>, HashMap<u64, String>)>),
 }
 
 #[relm4::component(pub)]
@@ -338,6 +369,8 @@ impl Component for CheaterModel {
             demos_done: 0,
             demos_total: 0,
             current_demo: None,
+            active_demos: 0,
+            progress_by_demo: HashMap::new(),
             accumulated: Vec::new(),
             name_lookup: HashMap::new(),
             queue_errors: Vec::new(),
@@ -358,7 +391,7 @@ impl Component for CheaterModel {
                 self.queue_settings = Some((enabled_overrides, param_overrides, threads));
                 self.demos_total = 1;
                 self.demos_done = 0;
-                self.start_next_demo(&sender);
+                self.start_available_demos(&sender);
                 root.present();
             }
             CheaterMsg::QueueCheck(demos, enabled_overrides, param_overrides, threads) => {
@@ -369,6 +402,7 @@ impl Component for CheaterModel {
                     // A queue is already draining: just append and keep going.
                     self.demos_total += demos.len();
                     self.queue.extend(demos);
+                    self.start_available_demos(&sender);
                 } else {
                     self.demo = demos
                         .last()
@@ -380,7 +414,7 @@ impl Component for CheaterModel {
                     self.queue_settings = Some((enabled_overrides, param_overrides, threads));
                     self.demos_total = self.queue.len();
                     self.demos_done = 0;
-                    self.start_next_demo(&sender);
+                    self.start_available_demos(&sender);
                 }
                 root.present();
             }
@@ -402,14 +436,34 @@ impl Component for CheaterModel {
         root: &Self::Root,
     ) {
         match message {
-            CheaterCmd::Progress(current, total, tps) => {
-                self.progress = (current, total);
-                self.tps = tps;
+            CheaterCmd::Progress(demo_name, current, total, tps) => {
+                self.current_demo = Some(demo_name.clone());
+                self.progress_by_demo
+                    .insert(demo_name, (current, total, tps));
+                if self.mass_mode {
+                    self.progress = self.progress_by_demo.values().fold(
+                        (0_u32, 0_u32),
+                        |(current_sum, total_sum), value| {
+                            (
+                                current_sum.saturating_add(value.0),
+                                total_sum.saturating_add(value.1),
+                            )
+                        },
+                    );
+                    self.tps = self.progress_by_demo.values().map(|value| value.2).sum();
+                } else {
+                    self.progress = (current, total);
+                    self.tps = tps;
+                }
                 return;
             }
-            CheaterCmd::Done(result) => {
-                self.loading = false;
-                let finished_demo = self.current_demo.take().unwrap_or_default();
+            CheaterCmd::Done(finished_demo, dem, result) => {
+                self.active_demos = self.active_demos.saturating_sub(1);
+                self.progress_by_demo.remove(&finished_demo);
+                if !self.mass_mode {
+                    self.demo = dem;
+                }
+
                 match result {
                     Ok((detections, names)) => {
                         if self.mass_mode {
@@ -426,25 +480,29 @@ impl Component for CheaterModel {
                         self.name_lookup.extend(names);
                     }
                     Err(e) => {
-                        // A demo that fails to analyse shouldn't sink the rest of
-                        // the queue; collect it and keep going.
-                        self.queue_errors.push((finished_demo.clone(), e.to_string()));
+                        // A demo that fails to analyse should not sink the rest
+                        // of a batch.
+                        self.queue_errors
+                            .push((finished_demo.clone(), e.to_string()));
                         if !self.mass_mode {
                             util::notice_dialog(
                                 &root,
                                 "An error occured while analysing the demo",
                                 &e.to_string(),
                             );
-                            return;
                         }
                     }
                 }
                 self.demos_done += 1;
 
-                if !self.queue.is_empty() {
-                    self.start_next_demo(&sender);
+                self.start_available_demos(&sender);
+                if !self.queue.is_empty() || self.active_demos > 0 {
+                    self.loading = true;
                     return;
                 }
+
+                self.loading = false;
+                self.current_demo = None;
                 self.queue_settings = None;
                 self.build_results();
                 if !self.mass_mode {
@@ -499,8 +557,10 @@ impl CheaterModel {
         };
         self.report = detail::full_report(&report_title, &report_rows);
         if !self.queue_errors.is_empty() {
-            self.report
-                .push_str(&format!("\n{} demo(s) failed to analyse:\n", self.queue_errors.len()));
+            self.report.push_str(&format!(
+                "\n{} demo(s) failed to analyse:\n",
+                self.queue_errors.len()
+            ));
             for (demo, err) in &self.queue_errors {
                 self.report.push_str(&format!("  {demo}: {err}\n"));
             }
@@ -697,10 +757,9 @@ impl FactoryComponent for CheaterRowModel {
                 }
             }
             CheaterRowMsg::OpenSteamhistory => {
-                if let Err(e) = opener::open_browser(format!(
-                    "https://steamhistory.net/id/{}",
-                    self.steamid64
-                )) {
+                if let Err(e) =
+                    opener::open_browser(format!("https://steamhistory.net/id/{}", self.steamid64))
+                {
                     log::warn!("Failed to open browser, {e}");
                 }
             }

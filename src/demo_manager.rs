@@ -159,16 +159,22 @@ impl Demo {
         param_overrides: &demo_analysis::lib::parameters::Config,
         threads: usize,
         progress_cb: impl Fn(usize, u32, u32) + Sync,
-    ) -> Result<Arc<Vec<demo_analysis::lib::algorithm::Detection>>> {
-        let detections = crate::cheat_analysis::analyse_demo(
+    ) -> Result<(
+        Arc<Vec<demo_analysis::lib::algorithm::Detection>>,
+        HashMap<u64, String>,
+    )> {
+        let analysis = crate::cheat_analysis::analyse_demo(
             self.path.clone(),
             enabled_overrides.clone(),
             param_overrides.clone(),
             threads,
             progress_cb,
         )?;
-        self.cheat_detections = Some(Arc::new(detections));
-        Ok(self.cheat_detections.as_ref().unwrap().clone())
+        self.cheat_detections = Some(Arc::new(analysis.detections));
+        Ok((
+            self.cheat_detections.as_ref().unwrap().clone(),
+            analysis.player_names,
+        ))
     }
 
     pub async fn has_replay(&self, replays_folder: &async_std::path::Path) -> bool {
@@ -224,6 +230,16 @@ impl Demo {
             .map(|h| h.ticks as f32 / h.duration)
             .map(|tps| if tps.is_finite() { tps } else { Demo::TICKRATE })
             .unwrap_or(Demo::TICKRATE)
+    }
+
+    pub fn strip_user_commands(&mut self) -> Result<usize> {
+        let raw = fs::read(&self.path)?;
+        let (stripped_data, count) = crate::demo_strip::strip_user_commands(&raw)?;
+        if count > 0 {
+            fs::write(&self.path, stripped_data)?;
+            self.size = fs::metadata(&self.path).ok().map(|metadata| metadata.len());
+        }
+        Ok(count)
     }
 
     pub async fn convert_to_replay(

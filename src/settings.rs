@@ -21,7 +21,8 @@ pub struct Settings {
     pub cheat_algo_enabled: HashMap<String, bool>,
     // Overrides for `CheatAlgorithm::params()`; missing algorithms/params use their own defaults.
     pub cheat_algo_params: demo_analysis::lib::parameters::Config,
-    // Number of threads used to run cheat detection algorithms concurrently.
+    // Overall worker budget for cheat analysis. Batch analysis spreads it across
+    // demos; a single demo uses the measured useful amount of intra-demo parallelism.
     pub cheat_analysis_threads: usize,
     // Name of the last profile selected in the Cheat Detection settings, so the dropdown
     // selection is restored across sessions.
